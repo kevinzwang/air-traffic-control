@@ -81,19 +81,36 @@ func ListWorktrees(repoPath string) ([]string, error) {
 	return worktrees, nil
 }
 
-// NormalizeBranchName converts a session name to a valid git branch name
-func NormalizeBranchName(name string) string {
-	// Convert to lowercase and replace spaces with hyphens
-	normalized := strings.ToLower(name)
-	normalized = strings.ReplaceAll(normalized, " ", "-")
+// ValidateBranchName checks if a name is valid for use as a git branch name
+// Returns an error describing the issue if invalid, nil if valid
+func ValidateBranchName(name string) error {
+	if name == "" {
+		return fmt.Errorf("name cannot be empty")
+	}
 
-	// Replace other invalid characters
-	normalized = strings.Map(func(r rune) rune {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
-			return r
+	if strings.HasPrefix(name, "-") {
+		return fmt.Errorf("name cannot start with '-'")
+	}
+
+	if strings.HasPrefix(name, ".") {
+		return fmt.Errorf("name cannot start with '.'")
+	}
+
+	if strings.Contains(name, "..") {
+		return fmt.Errorf("name cannot contain '..'")
+	}
+
+	if strings.Contains(name, " ") {
+		return fmt.Errorf("name cannot contain spaces")
+	}
+
+	// Check for valid characters: alphanumeric, -, _, /, .
+	for _, r := range name {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') ||
+			r == '-' || r == '_' || r == '/' || r == '.') {
+			return fmt.Errorf("name contains invalid character '%c'", r)
 		}
-		return '-'
-	}, normalized)
+	}
 
-	return normalized
+	return nil
 }

@@ -9,7 +9,9 @@ import (
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/kevinwang/air-traffic-control/internal/session"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/kevinzwang/air-traffic-control/internal/session"
+	"github.com/kevinzwang/air-traffic-control/internal/worktree"
 )
 
 type state int
@@ -20,20 +22,34 @@ const (
 	stateConfirmDelete
 )
 
+// Layout constants
+const (
+	appVersion         = "0.1.0"
+	contentWidth       = 71 // Inner width (total 73 - 2 for borders)
+	fixedUILines       = 13 // Lines used by borders, input, dividers, help text
+	linesPerSession    = 2  // Each session displays name + metadata
+	maxSessionsVisible = 15 // Cap to prevent overly tall box
+	summaryMaxLen      = 35 // Max characters for conversation summary
+	summaryTruncateAt  = 32 // Where to truncate before adding "..."
+)
+
 type Model struct {
-	state          state
-	service        *session.Service
-	repoName       string
-	sessions       []*session.Session
+	state            state
+	service          *session.Service
+	repoName         string
+	sessions         []*session.Session
 	filteredSessions []*session.Session
-	textInput      textinput.Model
-	cursor         int
-	spinner        spinner.Model
-	err            error
-	message        string
-	selectedSession *session.Session
-	createOutput   string
-	commandToExec  string
+	textInput        textinput.Model
+	cursor           int
+	scrollOffset     int
+	spinner          spinner.Model
+	err              error
+	message          string
+	selectedSession  *session.Session
+	createOutput     string
+	commandToExec    string
+	windowHeight     int
+	windowWidth      int
 }
 
 type sessionsLoadedMsg struct {
@@ -61,7 +77,7 @@ type errMsg struct {
 	err error
 }
 
-func NewModel(service *session.Service, repoName string) Model {
+func NewModel(service *session.Service, repoName string) *Model {
 	ti := textinput.New()
 	ti.Placeholder = "Type to search or create..."
 	ti.Focus()
@@ -71,7 +87,7 @@ func NewModel(service *session.Service, repoName string) Model {
 	s := spinner.New()
 	s.Spinner = spinner.Dot
 
-	return Model{
+	return &Model{
 		state:     stateMain,
 		service:   service,
 		repoName:  repoName,
@@ -81,7 +97,7 @@ func NewModel(service *session.Service, repoName string) Model {
 	}
 }
 
-func (m Model) Init() tea.Cmd {
+func (m *Model) Init() tea.Cmd {
 	return tea.Batch(
 		textinput.Blink,
 		m.loadSessions(),
@@ -89,7 +105,7 @@ func (m Model) Init() tea.Cmd {
 	)
 }
 
-func (m Model) loadSessions() tea.Cmd {
+func (m *Model) loadSessions() tea.Cmd {
 	return func() tea.Msg {
 		sessions, err := m.service.ListSessions("")
 		if err != nil {
@@ -99,8 +115,13 @@ func (m Model) loadSessions() tea.Cmd {
 	}
 }
 
-func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.windowHeight = msg.Height
+		m.windowWidth = msg.Width
+		return m, nil
+
 	case tea.KeyMsg:
 		return m.handleKeyMsg(msg)
 
@@ -110,10 +131,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case sessionCreatedMsg:
-		m.state = stateMain
-		m.message = fmt.Sprintf("✓ Session '%s' created successfully", msg.session.Name)
-		m.textInput.SetValue("")
-		return m, m.loadSessions()
+		// Enter the newly created session immediately
+		m.commandToExec = worktree.GetClaudeCommand(msg.session.WorktreePath)
+		return m, tea.Quit
 
 	case sessionDeletedMsg:
 		m.state = stateMain
@@ -165,16 +185,18 @@ func (m *Model) handleMainKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+c", "esc":
 		return m, tea.Quit
 
-	case "up", "k":
+	case "up":
 		if m.cursor > 0 {
 			m.cursor--
+			m.adjustScroll()
 		}
 		return m, nil
 
-	case "down", "j":
+	case "down":
 		maxCursor := len(m.filteredSessions) // +1 for "Create new" option
 		if m.cursor < maxCursor {
 			m.cursor++
+			m.adjustScroll()
 		}
 		return m, nil
 
@@ -188,10 +210,13 @@ func (m *Model) handleMainKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleArchiveToggle()
 
 	default:
-		// Clear message on any key press
+		// Pass key to text input for typing
 		m.message = ""
 		m.err = nil
-		return m, nil
+		var cmd tea.Cmd
+		m.textInput, cmd = m.textInput.Update(msg)
+		m.filterSessions()
+		return m, cmd
 	}
 }
 
@@ -202,21 +227,19 @@ func (m *Model) handleEnter() (tea.Model, tea.Cmd) {
 	}
 
 	// Enter existing session
-	sessionIdx := m.cursor - 1
-	if sessionIdx >= 0 && sessionIdx < len(m.filteredSessions) {
-		selectedSession := m.filteredSessions[sessionIdx]
-		cmd, err := m.service.EnterSession(selectedSession.Name)
-		if err != nil {
-			m.err = err
-			return m, nil
-		}
-
-		// Store command and quit to exec it
-		m.commandToExec = cmd
-		return m, tea.Quit
+	selected := m.getSelectedSession()
+	if selected == nil {
+		return m, nil
 	}
 
-	return m, nil
+	cmd, err := m.service.EnterSession(selected.Name)
+	if err != nil {
+		m.err = err
+		return m, nil
+	}
+
+	m.commandToExec = cmd
+	return m, tea.Quit
 }
 
 func (m *Model) createSession() (tea.Model, tea.Cmd) {
@@ -242,51 +265,51 @@ func (m *Model) createSession() (tea.Model, tea.Cmd) {
 	}
 }
 
-func (m *Model) handleDelete() (tea.Model, tea.Cmd) {
-	// Can't delete "Create new" option
+// getSelectedSession returns the currently selected session, or nil if cursor
+// is on "Create new" option or out of bounds
+func (m *Model) getSelectedSession() *session.Session {
 	if m.cursor == 0 {
-		return m, nil
+		return nil
 	}
-
 	sessionIdx := m.cursor - 1
 	if sessionIdx >= 0 && sessionIdx < len(m.filteredSessions) {
-		m.selectedSession = m.filteredSessions[sessionIdx]
-		m.state = stateConfirmDelete
+		return m.filteredSessions[sessionIdx]
 	}
+	return nil
+}
 
+func (m *Model) handleDelete() (tea.Model, tea.Cmd) {
+	selected := m.getSelectedSession()
+	if selected == nil {
+		return m, nil
+	}
+	m.selectedSession = selected
+	m.state = stateConfirmDelete
 	return m, nil
 }
 
 func (m *Model) handleArchiveToggle() (tea.Model, tea.Cmd) {
-	// Can't archive "Create new" option
-	if m.cursor == 0 {
+	selected := m.getSelectedSession()
+	if selected == nil {
 		return m, nil
 	}
 
-	sessionIdx := m.cursor - 1
-	if sessionIdx >= 0 && sessionIdx < len(m.filteredSessions) {
-		selectedSession := m.filteredSessions[sessionIdx]
-
-		if selectedSession.Status == "archived" {
-			return m, func() tea.Msg {
-				err := m.service.UnarchiveSession(selectedSession.Name)
-				if err != nil {
-					return errMsg{err}
-				}
-				return sessionUnarchivedMsg{selectedSession.Name}
+	if selected.Status == "archived" {
+		return m, func() tea.Msg {
+			err := m.service.UnarchiveSession(selected.Name)
+			if err != nil {
+				return errMsg{err}
 			}
-		} else {
-			return m, func() tea.Msg {
-				err := m.service.ArchiveSession(selectedSession.Name)
-				if err != nil {
-					return errMsg{err}
-				}
-				return sessionArchivedMsg{selectedSession.Name}
-			}
+			return sessionUnarchivedMsg{selected.Name}
 		}
 	}
-
-	return m, nil
+	return m, func() tea.Msg {
+		err := m.service.ArchiveSession(selected.Name)
+		if err != nil {
+			return errMsg{err}
+		}
+		return sessionArchivedMsg{selected.Name}
+	}
 }
 
 func (m *Model) handleDeleteConfirmKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -313,26 +336,67 @@ func (m *Model) handleDeleteConfirmKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m *Model) filterSessions() {
 	query := strings.ToLower(strings.TrimSpace(m.textInput.Value()))
 
-	if query == "" {
-		m.filteredSessions = m.sessions
-	} else {
-		filtered := []*session.Session{}
-		for _, s := range m.sessions {
-			if strings.Contains(strings.ToLower(s.Name), query) {
-				filtered = append(filtered, s)
-			}
+	// Partition sessions into active and archived, filtering by query
+	var active, archived []*session.Session
+	for _, s := range m.sessions {
+		if query != "" && !strings.Contains(strings.ToLower(s.Name), query) {
+			continue
 		}
-		m.filteredSessions = filtered
+		if s.Status == "archived" {
+			archived = append(archived, s)
+		} else {
+			active = append(active, s)
+		}
 	}
 
-	// Reset cursor if out of bounds
-	maxCursor := len(m.filteredSessions)
-	if m.cursor > maxCursor {
+	// Display order: active sessions first, then archived
+	m.filteredSessions = append(active, archived...)
+
+	// Clamp cursor to valid range
+	if maxCursor := len(m.filteredSessions); m.cursor > maxCursor {
 		m.cursor = maxCursor
+	}
+	m.adjustScroll()
+}
+
+// maxVisibleSessions returns how many sessions can fit in the terminal
+func (m *Model) maxVisibleSessions() int {
+	if m.windowHeight <= fixedUILines {
+		return 1
+	}
+	availableLines := m.windowHeight - fixedUILines
+	maxSessions := availableLines / linesPerSession
+
+	if maxSessions > maxSessionsVisible {
+		maxSessions = maxSessionsVisible
+	}
+	return maxSessions
+}
+
+// adjustScroll ensures the cursor is visible within the scroll window
+func (m *Model) adjustScroll() {
+	maxVisible := m.maxVisibleSessions()
+	if maxVisible <= 0 {
+		maxVisible = 1
+	}
+
+	// If cursor is above visible area, scroll up
+	if m.cursor < m.scrollOffset {
+		m.scrollOffset = m.cursor
+	}
+
+	// If cursor is below visible area, scroll down
+	if m.cursor >= m.scrollOffset+maxVisible {
+		m.scrollOffset = m.cursor - maxVisible + 1
+	}
+
+	// Ensure scroll offset is not negative
+	if m.scrollOffset < 0 {
+		m.scrollOffset = 0
 	}
 }
 
-func (m Model) View() string {
+func (m *Model) View() string {
 	switch m.state {
 	case stateMain:
 		return m.viewMain()
@@ -344,139 +408,210 @@ func (m Model) View() string {
 	return ""
 }
 
-func (m Model) viewMain() string {
-	var b strings.Builder
+func (m *Model) viewMain() string {
+	var content strings.Builder
+	divider := dividerStyle.Render(strings.Repeat("─", contentWidth))
+	pad := " " // Manual padding since container has none
 
-	// Title
-	b.WriteString(titleStyle.Render("Air Traffic Control (ATC)"))
-	b.WriteString("\n")
-	b.WriteString(statusStyle.Render(fmt.Sprintf("Repo: %s", m.repoName)))
-	b.WriteString("\n\n")
-
+	// Repo name (right-aligned)
+	repoNameStyled := subtitleStyle.Render("repo: " + m.repoName)
+	repoNameWidth := lipgloss.Width(repoNameStyled)
+	repoNamePadding := contentWidth - repoNameWidth - 1 // -1 for right margin
+	if repoNamePadding < 0 {
+		repoNamePadding = 0
+	}
+	content.WriteString(strings.Repeat(" ", repoNamePadding) + repoNameStyled + "\n")
 	// Input
-	b.WriteString(inputStyle.Render("> ") + m.textInput.View())
-	b.WriteString("\n\n")
+	content.WriteString(pad + m.textInput.View() + "\n")
+	// Padding line after input
+	content.WriteString(pad + "\n")
+	// Divider before session list
+	content.WriteString(divider + "\n")
+	// Padding line
+	content.WriteString(pad + "\n")
 
 	// Error/Message
 	if m.err != nil {
-		b.WriteString(errorStyle.Render(fmt.Sprintf("✗ Error: %s", m.err.Error())))
-		b.WriteString("\n\n")
+		content.WriteString(pad + errorStyle.Render(fmt.Sprintf("Error: %s", m.err.Error())))
+		content.WriteString("\n")
 	} else if m.message != "" {
-		b.WriteString(successStyle.Render(m.message))
-		b.WriteString("\n\n")
+		content.WriteString(pad + successStyle.Render(m.message))
+		content.WriteString("\n")
 	}
 
-	// "Create new" option
-	createNewText := fmt.Sprintf("✨ Create new session \"%s\"", m.textInput.Value())
+	// "Create new" option (always visible, position 0)
+	createNewText := fmt.Sprintf("+ New session \"%s\"", m.textInput.Value())
 	if m.cursor == 0 {
-		b.WriteString(selectedItemStyle.Render("→ " + createNewText))
+		content.WriteString(pad + selectedItemStyle.Render("▶ " + createNewText))
 	} else {
-		b.WriteString(createNewStyle.Render("  " + createNewText))
+		content.WriteString(pad + createNewStyle.Render("  " + createNewText))
 	}
-	b.WriteString("\n\n")
+	content.WriteString("\n")
 
-	// Session list
-	activeSessions := []*session.Session{}
-	archivedSessions := []*session.Session{}
+	// Calculate visible range
+	maxVisible := m.maxVisibleSessions()
+	totalSessions := len(m.filteredSessions)
 
-	for _, s := range m.filteredSessions {
-		if s.Status == "archived" {
-			archivedSessions = append(archivedSessions, s)
-		} else {
-			activeSessions = append(activeSessions, s)
-		}
+	// Always show scroll indicator line (empty if nothing above)
+	if m.scrollOffset > 0 {
+		content.WriteString(pad + metadataStyle.Render(fmt.Sprintf("  ↑ %d more", m.scrollOffset)))
+	} else {
+		content.WriteString(pad) // Reserve space
+	}
+	content.WriteString("\n")
+
+	// Render visible sessions
+	endIdx := m.scrollOffset + maxVisible
+	if endIdx > totalSessions {
+		endIdx = totalSessions
 	}
 
-	// Render active sessions
-	for i, s := range activeSessions {
+	sessionsRendered := 0
+	for i := m.scrollOffset; i < endIdx; i++ {
+		s := m.filteredSessions[i]
 		cursorPos := i + 1 // +1 for "Create new" option
-		m.renderSession(&b, s, cursorPos)
+		m.renderSession(&content, s, cursorPos)
+		sessionsRendered++
 	}
 
-	// Separator if there are archived sessions
-	if len(archivedSessions) > 0 {
-		b.WriteString("\n")
-		b.WriteString(separatorStyle.Render("─────────────── Archived ───────────────"))
-		b.WriteString("\n")
+	// Add padding lines to fill terminal height (each session is 2 lines)
+	paddingNeeded := (maxVisible - sessionsRendered) * 2
+	for i := 0; i < paddingNeeded; i++ {
+		content.WriteString(pad + "\n")
+	}
 
-		// Render archived sessions
-		for i, s := range archivedSessions {
-			cursorPos := len(activeSessions) + i + 1
-			m.renderSession(&b, s, cursorPos)
+	// Always show scroll indicator line (empty if nothing below)
+	if endIdx < totalSessions {
+		content.WriteString(pad + metadataStyle.Render(fmt.Sprintf("  ↓ %d more", totalSessions-endIdx)))
+	} else {
+		content.WriteString(pad) // Reserve space
+	}
+	content.WriteString("\n")
+	// Padding line between list and divider
+	content.WriteString(pad + "\n")
+
+	// Help text (divider then instructions, no gap between)
+	content.WriteString(divider + "\n")
+	content.WriteString(pad + helpStyle.Render("[↑/↓] Navigate  [Enter] Select  [^D] Delete  [^A] Archive  [Esc] Quit"))
+	content.WriteString("\n")
+
+	// Build the box manually for full control (no lipgloss border)
+
+	// Top border with embedded title
+	title := titleStyle.Render("🛫 Air Traffic Control") + " " + subtitleStyle.Render("v"+appVersion)
+	topLeft := borderStyle.Render("╭─ ")
+	topRight := borderStyle.Render(" ───────────────────────────────────────╮")
+	topBorder := topLeft + title + topRight
+
+	// Wrap each content line with side borders
+	lines := strings.Split(content.String(), "\n")
+	var body strings.Builder
+	body.WriteString(topBorder + "\n")
+	leftBorder := borderStyle.Render("│")
+	rightBorder := borderStyle.Render("│")
+	for _, line := range lines {
+		if line == "" {
+			continue // Skip empty lines
 		}
+		// Use lipgloss.Width for visual width (handles ANSI codes)
+		visualWidth := lipgloss.Width(line)
+		padding := contentWidth - visualWidth
+		if padding < 0 {
+			padding = 0
+		}
+		body.WriteString(leftBorder + line + strings.Repeat(" ", padding) + rightBorder + "\n")
 	}
 
-	// Help text
-	b.WriteString("\n")
-	b.WriteString(helpStyle.Render("[↑/↓] Navigate  [Enter] Open/Create  [Ctrl+D] Delete  [Ctrl+A] Archive  [Esc] Quit"))
+	// Bottom border
+	body.WriteString(borderStyle.Render("╰" + strings.Repeat("─", contentWidth) + "╯"))
 
-	return b.String()
+	return body.String()
 }
 
-func (m Model) renderSession(b *strings.Builder, s *session.Session, cursorPos int) {
+func (m *Model) renderSession(b *strings.Builder, s *session.Session, cursorPos int) {
+	pad := " " // Manual padding
 	cursor := "  "
 	style := normalItemStyle
+	metaStyle := metadataStyle
 	if m.cursor == cursorPos {
-		cursor = "→ "
+		cursor = "▶ "
 		style = selectedItemStyle
 	}
 
 	if s.Status == "archived" {
 		style = archivedItemStyle
+		metaStyle = archivedItemStyle
 	}
 
-	sessionLine := fmt.Sprintf("%s%-30s %s", cursor, s.Name, s.BranchName)
-	b.WriteString(style.Render(sessionLine))
+	// Session name
+	b.WriteString(pad + style.Render(cursor+s.Name))
 	b.WriteString("\n")
 
-	// Metadata
-	timeStr := formatTime(s.CreatedAt)
+	// Metadata line: summary (if any) + time
+	var timeStr string
 	if s.ArchivedAt != nil {
-		timeStr = "Archived " + formatTime(*s.ArchivedAt)
+		timeStr = "archived " + formatTime(*s.ArchivedAt)
+	} else if s.LastAccessed != nil {
+		timeStr = formatTime(*s.LastAccessed)
+	} else {
+		timeStr = formatTime(s.CreatedAt)
 	}
-	b.WriteString(metadataStyle.Render("└─ " + timeStr))
+
+	// Get conversation summary
+	summary := worktree.GetConversationSummary(s.WorktreePath)
+	var metaLine string
+	if summary != "" {
+		if len(summary) > summaryMaxLen {
+			summary = summary[:summaryTruncateAt] + "..."
+		}
+		metaLine = fmt.Sprintf("    %s · %s", summary, timeStr)
+	} else {
+		metaLine = "    " + timeStr
+	}
+	b.WriteString(pad + metaStyle.Render(metaLine))
 	b.WriteString("\n")
 }
 
-func (m Model) viewCreating() string {
-	var b strings.Builder
+func (m *Model) viewCreating() string {
+	var content strings.Builder
 
-	b.WriteString(titleStyle.Render(fmt.Sprintf("Creating session \"%s\"...", m.textInput.Value())))
-	b.WriteString("\n\n")
+	header := titleStyle.Render("✈ Air Traffic Control")
+	content.WriteString(headerStyle.Render(header))
+	content.WriteString("\n\n")
 
-	b.WriteString(statusStyle.Render(fmt.Sprintf("%s Please wait...", m.spinner.View())))
-	b.WriteString("\n\n")
+	content.WriteString(statusStyle.Render(fmt.Sprintf("%s Creating \"%s\"...", m.spinner.View(), m.textInput.Value())))
+	content.WriteString("\n\n")
 
 	if m.createOutput != "" {
-		b.WriteString(dialogTextStyle.Render(m.createOutput))
+		content.WriteString(dialogTextStyle.Render(m.createOutput))
 	}
 
-	return b.String()
+	return containerStyle.Render(content.String())
 }
 
-func (m Model) viewConfirmDelete() string {
+func (m *Model) viewConfirmDelete() string {
 	if m.selectedSession == nil {
 		return ""
 	}
 
 	var b strings.Builder
 
-	b.WriteString(dialogTitleStyle.Render("Confirm Deletion"))
+	b.WriteString(dialogTitleStyle.Render("Delete Session"))
 	b.WriteString("\n\n")
 
-	b.WriteString(dialogTextStyle.Render(fmt.Sprintf("Delete session \"%s\"?", m.selectedSession.Name)))
+	b.WriteString(dialogTextStyle.Render(fmt.Sprintf("Delete \"%s\"?", m.selectedSession.Name)))
 	b.WriteString("\n\n")
 
 	b.WriteString(dialogTextStyle.Render("This will:"))
 	b.WriteString("\n")
-	b.WriteString(dialogTextStyle.Render("- Remove the git worktree"))
+	b.WriteString(dialogTextStyle.Render("  • Remove the git worktree"))
 	b.WriteString("\n")
-	b.WriteString(dialogTextStyle.Render("- Delete all local changes in the worktree"))
+	b.WriteString(dialogTextStyle.Render("  • Delete all local changes"))
 	b.WriteString("\n")
-	b.WriteString(dialogTextStyle.Render("- Remove the session from ATC"))
+	b.WriteString(dialogTextStyle.Render("  • Remove the session"))
 	b.WriteString("\n\n")
 
-	b.WriteString(warningStyle.Render("This action cannot be undone."))
+	b.WriteString(warningStyle.Render("This cannot be undone."))
 	b.WriteString("\n\n")
 
 	b.WriteString(dialogTextStyle.Render("[Y] Yes, delete    [N] Cancel"))
@@ -485,45 +620,46 @@ func (m Model) viewConfirmDelete() string {
 }
 
 func formatTime(t time.Time) string {
-	now := time.Now()
-	diff := now.Sub(t)
+	diff := time.Since(t)
 
 	if diff < time.Minute {
 		return "just now"
-	} else if diff < time.Hour {
-		minutes := int(diff.Minutes())
-		if minutes == 1 {
-			return "1 minute ago"
-		}
-		return fmt.Sprintf("%d minutes ago", minutes)
-	} else if diff < 24*time.Hour {
-		hours := int(diff.Hours())
-		if hours == 1 {
-			return "1 hour ago"
-		}
-		return fmt.Sprintf("%d hours ago", hours)
-	} else if diff < 7*24*time.Hour {
-		days := int(diff.Hours() / 24)
-		if days == 1 {
-			return "1 day ago"
-		}
-		return fmt.Sprintf("%d days ago", days)
-	} else if diff < 30*24*time.Hour {
-		weeks := int(diff.Hours() / 24 / 7)
-		if weeks == 1 {
-			return "1 week ago"
-		}
-		return fmt.Sprintf("%d weeks ago", weeks)
-	} else {
-		months := int(diff.Hours() / 24 / 30)
-		if months == 1 {
-			return "1 month ago"
-		}
-		return fmt.Sprintf("%d months ago", months)
 	}
+
+	type timeUnit struct {
+		threshold time.Duration
+		divisor   time.Duration
+		singular  string
+		plural    string
+	}
+
+	units := []timeUnit{
+		{time.Hour, time.Minute, "minute", "minutes"},
+		{24 * time.Hour, time.Hour, "hour", "hours"},
+		{7 * 24 * time.Hour, 24 * time.Hour, "day", "days"},
+		{30 * 24 * time.Hour, 7 * 24 * time.Hour, "week", "weeks"},
+		{365 * 24 * time.Hour, 30 * 24 * time.Hour, "month", "months"},
+	}
+
+	for _, unit := range units {
+		if diff < unit.threshold {
+			count := int(diff / unit.divisor)
+			if count == 1 {
+				return "1 " + unit.singular + " ago"
+			}
+			return fmt.Sprintf("%d %s ago", count, unit.plural)
+		}
+	}
+
+	// Fallback for very old times (over a year)
+	months := int(diff / (30 * 24 * time.Hour))
+	if months == 1 {
+		return "1 month ago"
+	}
+	return fmt.Sprintf("%d months ago", months)
 }
 
 // GetCommandToExec returns the command that should be executed after TUI exits
-func (m Model) GetCommandToExec() string {
+func (m *Model) GetCommandToExec() string {
 	return m.commandToExec
 }

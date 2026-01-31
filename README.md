@@ -22,7 +22,7 @@ A CLI/TUI tool for managing multiple Claude Code agent sessions in separate git 
 ### Build from Source
 
 ```bash
-git clone https://github.com/kevinwang/air-traffic-control.git
+git clone https://github.com/kevinzwang/air-traffic-control.git
 cd air-traffic-control
 go build -o atc ./cmd/atc
 ```

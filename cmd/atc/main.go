@@ -8,9 +8,9 @@ import (
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/kevinwang/air-traffic-control/internal/database"
-	"github.com/kevinwang/air-traffic-control/internal/session"
-	"github.com/kevinwang/air-traffic-control/internal/tui"
+	"github.com/kevinzwang/air-traffic-control/internal/database"
+	"github.com/kevinzwang/air-traffic-control/internal/session"
+	"github.com/kevinzwang/air-traffic-control/internal/tui"
 )
 
 func main() {
@@ -71,7 +71,7 @@ func run() error {
 	}
 
 	// Check if we need to exec into a session
-	m := finalModel.(tui.Model)
+	m := finalModel.(*tui.Model)
 	if m.GetCommandToExec() != "" {
 		cmd := m.GetCommandToExec()
 		return execCommand(cmd)

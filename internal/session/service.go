@@ -8,9 +8,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/kevinwang/air-traffic-control/internal/config"
-	"github.com/kevinwang/air-traffic-control/internal/database"
-	"github.com/kevinwang/air-traffic-control/internal/worktree"
+	"github.com/kevinzwang/air-traffic-control/internal/config"
+	"github.com/kevinzwang/air-traffic-control/internal/database"
+	"github.com/kevinzwang/air-traffic-control/internal/worktree"
 )
 
 // Service manages session operations
@@ -42,19 +42,24 @@ func NewService(db *database.DB, repoPath string) (*Service, error) {
 // CreateSession creates a new session with worktree and setup commands
 func (s *Service) CreateSession(name string, output io.Writer) (*Session, error) {
 	// Check if session name already exists
+	// Validate name is valid for git branch
+	if err := worktree.ValidateBranchName(name); err != nil {
+		return nil, fmt.Errorf("invalid session name: %w", err)
+	}
+
 	existing, _ := s.db.GetSessionByName(name)
 	if existing != nil {
 		return nil, fmt.Errorf("session with name '%s' already exists", name)
 	}
 
-	// Create session record
+	// Create session record (name = branch name)
 	session := &Session{
 		ID:           uuid.New().String(),
 		Name:         name,
 		RepoPath:     s.repoPath,
 		RepoName:     s.repoName,
 		WorktreePath: filepath.Join(s.atcDir, "worktrees", s.repoName, name),
-		BranchName:   worktree.NormalizeBranchName(name),
+		BranchName:   name,
 		CreatedAt:    time.Now(),
 		Status:       "active",
 	}
@@ -88,20 +93,7 @@ func (s *Service) CreateSession(name string, output io.Writer) (*Session, error)
 	}
 
 	// Save to database
-	dbSession := &database.Session{
-		ID:            session.ID,
-		Name:          session.Name,
-		RepoPath:      session.RepoPath,
-		RepoName:      session.RepoName,
-		WorktreePath:  session.WorktreePath,
-		BranchName:    session.BranchName,
-		CreatedAt:     session.CreatedAt,
-		LastAccessed:  session.LastAccessed,
-		ArchivedAt:    session.ArchivedAt,
-		Status:        session.Status,
-	}
-
-	if err := s.db.InsertSession(dbSession); err != nil {
+	if err := s.db.InsertSession(session.toDBSession()); err != nil {
 		// Clean up worktree on error
 		worktree.DeleteWorktree(session.WorktreePath)
 		return nil, fmt.Errorf("failed to save session: %w", err)
@@ -119,20 +111,8 @@ func (s *Service) ListSessions(query string) ([]*Session, error) {
 
 	sessions := make([]*Session, len(dbSessions))
 	for i, dbs := range dbSessions {
-		sessions[i] = &Session{
-			ID:            dbs.ID,
-			Name:          dbs.Name,
-			RepoPath:      dbs.RepoPath,
-			RepoName:      dbs.RepoName,
-			WorktreePath:  dbs.WorktreePath,
-			BranchName:    dbs.BranchName,
-			CreatedAt:     dbs.CreatedAt,
-			LastAccessed:  dbs.LastAccessed,
-			ArchivedAt:    dbs.ArchivedAt,
-			Status:        dbs.Status,
-		}
+		sessions[i] = fromDBSession(dbs)
 	}
-
 	return sessions, nil
 }
 
@@ -142,19 +122,7 @@ func (s *Service) GetSession(name string) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	return &Session{
-		ID:            dbs.ID,
-		Name:          dbs.Name,
-		RepoPath:      dbs.RepoPath,
-		RepoName:      dbs.RepoName,
-		WorktreePath:  dbs.WorktreePath,
-		BranchName:    dbs.BranchName,
-		CreatedAt:     dbs.CreatedAt,
-		LastAccessed:  dbs.LastAccessed,
-		ArchivedAt:    dbs.ArchivedAt,
-		Status:        dbs.Status,
-	}, nil
+	return fromDBSession(dbs), nil
 }
 
 // DeleteSession removes a session and its worktree
@@ -199,31 +167,18 @@ func (s *Service) UnarchiveSession(name string) error {
 
 // EnterSession prepares to enter a session and returns the command to exec
 func (s *Service) EnterSession(name string) (string, error) {
-	session, err := s.GetSession(name)
+	sess, err := s.GetSession(name)
 	if err != nil {
 		return "", err
 	}
 
 	// Update last accessed time
 	now := time.Now()
-	session.LastAccessed = &now
+	sess.LastAccessed = &now
 
-	dbSession := &database.Session{
-		ID:            session.ID,
-		Name:          session.Name,
-		RepoPath:      session.RepoPath,
-		RepoName:      session.RepoName,
-		WorktreePath:  session.WorktreePath,
-		BranchName:    session.BranchName,
-		CreatedAt:     session.CreatedAt,
-		LastAccessed:  session.LastAccessed,
-		ArchivedAt:    session.ArchivedAt,
-		Status:        session.Status,
-	}
-
-	if err := s.db.UpdateSession(dbSession); err != nil {
+	if err := s.db.UpdateSession(sess.toDBSession()); err != nil {
 		return "", fmt.Errorf("failed to update session: %w", err)
 	}
 
-	return worktree.GetContinueCommand(session.WorktreePath), nil
+	return worktree.GetClaudeCommand(sess.WorktreePath), nil
 }

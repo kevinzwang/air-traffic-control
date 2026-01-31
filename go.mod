@@ -1,4 +1,4 @@
-module github.com/kevinwang/air-traffic-control
+module github.com/kevinzwang/air-traffic-control
 
 go 1.25.6
 
