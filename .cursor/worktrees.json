@@ -1,0 +1,6 @@
+{
+  "setup-worktree": [
+    "echo 'Setting up ATC worktree...'",
+    "go mod download"
+  ]
+}
