@@ -61,8 +61,14 @@ func run() error {
 	// Extract repo name for display
 	repoName := filepath.Base(repoPath)
 
+	// Get current branch from the invoking directory (may differ from main repo if in worktree)
+	invokingBranch, err := getCurrentBranch(cwd)
+	if err != nil {
+		invokingBranch = "HEAD" // Fallback
+	}
+
 	// Launch TUI
-	model := tui.NewModel(service, repoName)
+	model := tui.NewModel(service, repoName, invokingBranch)
 	p := tea.NewProgram(model, tea.WithAltScreen())
 
 	finalModel, err := p.Run()
@@ -72,8 +78,7 @@ func run() error {
 
 	// Check if we need to exec into a session
 	m := finalModel.(*tui.Model)
-	if m.GetCommandToExec() != "" {
-		cmd := m.GetCommandToExec()
+	if cmd := m.GetCommandToExec(); cmd != "" {
 		return execCommand(cmd)
 	}
 
@@ -88,8 +93,54 @@ func isGitRepo(dir string) bool {
 }
 
 // getGitRoot returns the root directory of the git repository
+// If invoked from a worktree, it returns the main repository's path
 func getGitRoot(dir string) (string, error) {
+	// First, get the common git directory (main repo's .git, even in worktrees)
+	cmdCommon := exec.Command("git", "rev-parse", "--git-common-dir")
+	cmdCommon.Dir = dir
+	commonOutput, err := cmdCommon.Output()
+	if err != nil {
+		return "", err
+	}
+	commonDir := strings.TrimSpace(string(commonOutput))
+
+	// Get the regular git directory
+	cmdGitDir := exec.Command("git", "rev-parse", "--git-dir")
+	cmdGitDir.Dir = dir
+	gitDirOutput, err := cmdGitDir.Output()
+	if err != nil {
+		return "", err
+	}
+	gitDir := strings.TrimSpace(string(gitDirOutput))
+
+	// If they differ, we're in a worktree - use the main repo path
+	// commonDir will be like "/path/to/main-repo/.git"
+	if commonDir != gitDir {
+		// Remove the /.git suffix to get the main repo path
+		if strings.HasSuffix(commonDir, "/.git") {
+			return strings.TrimSuffix(commonDir, "/.git"), nil
+		}
+		// Handle case where commonDir is just ".git" (relative path)
+		if commonDir == ".git" {
+			// Fall through to use --show-toplevel
+		} else {
+			return filepath.Dir(commonDir), nil
+		}
+	}
+
+	// Not in a worktree, use regular toplevel
 	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
+	cmd.Dir = dir
+	output, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+// getCurrentBranch returns the current branch name for the given directory
+func getCurrentBranch(dir string) (string, error) {
+	cmd := exec.Command("git", "rev-parse", "--abbrev-ref", "HEAD")
 	cmd.Dir = dir
 	output, err := cmd.Output()
 	if err != nil {

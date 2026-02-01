@@ -9,14 +9,25 @@ import (
 )
 
 // CreateWorktree creates a new git worktree
-func CreateWorktree(repoPath, sessionName, branchName, targetPath string) error {
+// If useExisting is true, it attaches to an existing branch instead of creating a new one
+// baseBranch specifies the base for new branches (ignored when useExisting is true)
+func CreateWorktree(repoPath, sessionName, branchName, targetPath, baseBranch string, useExisting bool) error {
 	// Ensure target directory's parent exists
 	if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
 		return fmt.Errorf("failed to create target directory: %w", err)
 	}
 
-	// Create the worktree
-	cmd := exec.Command("git", "worktree", "add", "-b", branchName, targetPath, "HEAD")
+	var cmd *exec.Cmd
+	if useExisting {
+		// Attach worktree to existing branch
+		cmd = exec.Command("git", "worktree", "add", targetPath, branchName)
+	} else {
+		// Create new branch from base
+		if baseBranch == "" {
+			baseBranch = "HEAD"
+		}
+		cmd = exec.Command("git", "worktree", "add", "-b", branchName, targetPath, baseBranch)
+	}
 	cmd.Dir = repoPath
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -81,6 +92,39 @@ func ListWorktrees(repoPath string) ([]string, error) {
 	return worktrees, nil
 }
 
+// ListBranches returns all local branch names for a repository
+func ListBranches(repoPath string) ([]string, error) {
+	cmd := exec.Command("git", "branch", "--format=%(refname:short)")
+	cmd.Dir = repoPath
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list branches: %w\nOutput: %s", err, string(output))
+	}
+
+	branches := []string{}
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			branches = append(branches, line)
+		}
+	}
+
+	return branches, nil
+}
+
+// GetCurrentBranch returns the name of the current HEAD branch
+func GetCurrentBranch(repoPath string) (string, error) {
+	cmd := exec.Command("git", "rev-parse", "--abbrev-ref", "HEAD")
+	cmd.Dir = repoPath
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("failed to get current branch: %w\nOutput: %s", err, string(output))
+	}
+
+	return strings.TrimSpace(string(output)), nil
+}
+
 // ValidateBranchName checks if a name is valid for use as a git branch name
 // Returns an error describing the issue if invalid, nil if valid
 func ValidateBranchName(name string) error {
@@ -104,13 +148,27 @@ func ValidateBranchName(name string) error {
 		return fmt.Errorf("name cannot contain spaces")
 	}
 
-	// Check for valid characters: alphanumeric, -, _, /, .
 	for _, r := range name {
-		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') ||
-			r == '-' || r == '_' || r == '/' || r == '.') {
+		if !isValidBranchChar(r) {
 			return fmt.Errorf("name contains invalid character '%c'", r)
 		}
 	}
 
 	return nil
+}
+
+// isValidBranchChar returns true if the rune is valid in a git branch name
+func isValidBranchChar(r rune) bool {
+	switch {
+	case r >= 'a' && r <= 'z':
+		return true
+	case r >= 'A' && r <= 'Z':
+		return true
+	case r >= '0' && r <= '9':
+		return true
+	case r == '-', r == '_', r == '/', r == '.':
+		return true
+	default:
+		return false
+	}
 }
