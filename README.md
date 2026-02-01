@@ -2,7 +2,9 @@
 
 A CLI/TUI tool for managing multiple Claude Code agent sessions in separate git worktrees.
 
-![ATC Screenshot](screenshot.png)
+<p align="center">
+  <img src="screenshot.png" width="50%" alt="ATC Screenshot">
+</p>
 
 ## Features
 
