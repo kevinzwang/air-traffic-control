@@ -2,6 +2,8 @@
 
 A CLI/TUI tool for managing multiple Claude Code agent sessions in separate git worktrees.
 
+![ATC Screenshot](screenshot.png)
+
 ## Features
 
 - **Session Management**: Create, list, archive, and delete Claude Code sessions
