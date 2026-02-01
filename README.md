@@ -1,6 +1,9 @@
-# ✈️ Air Traffic Control (ATC)
+# ✈️ Air Traffic Control
 
-A CLI/TUI tool for managing multiple Claude Code agent sessions in separate git worktrees.
+Manage a fleet of coding agents without going insane. 
+
+Air Traffic Control (ATC) is a TUI that helps you isolate and collaborate with multiple Claude Code instances on the same project.
+Manage agent "sessions", which tie together agents with code and git state. Let ATC automatically handle setup and management of git worktrees, and seamlessly spawn and move across agent conversations.
 
 <p align="center">
   <img src="screenshot.png" width="50%" alt="ATC Screenshot">
@@ -51,59 +54,12 @@ mv atc ~/.local/bin/  # or /usr/local/bin/
 
 ## Usage
 
-### Start ATC
-
 Navigate to any git repository and run:
 
 ```bash
 cd /path/to/your/repo
 atc
 ```
-
-### TUI Controls
-
-- **Type**: Search or enter new session name
-- **↑/↓ or k/j**: Navigate between sessions
-- **Enter**:
-  - On "Create new session": Creates a new session
-  - On existing session: Opens session in Claude Code
-- **Ctrl+D**: Delete selected session (with confirmation)
-- **Ctrl+A**: Archive/unarchive selected session
-- **Esc**: Quit ATC
-
-### Creating a Session
-
-1. Run `atc` in your repository
-2. Type a session name (e.g., "auth-refactor")
-3. Press Enter on the "✨ Create new session" option
-4. ATC will:
-   - Create a git worktree at `~/.atc/worktrees/<repo-name>/<session-name>`
-   - Create a new branch with the normalized session name
-   - Run setup commands from `.cursor/worktrees.json` (if present)
-   - Save the session to the database
-
-### Opening a Session
-
-1. Run `atc` in your repository
-2. Type to filter sessions or navigate with ↑/↓
-3. Press Enter on the desired session
-4. ATC will exit and run `claude --continue` in the worktree directory
-
-### Archiving a Session
-
-1. Navigate to a session
-2. Press Ctrl+A
-3. The session is marked as archived and moved to the "Archived" section
-4. Press Ctrl+A again to unarchive
-
-### Deleting a Session
-
-1. Navigate to a session
-2. Press Ctrl+D
-3. Confirm deletion by pressing Y
-4. ATC will:
-   - Remove the git worktree
-   - Delete the session from the database
 
 ## Configuration
 
