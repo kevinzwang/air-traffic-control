@@ -40,9 +40,9 @@ func NewService(db *database.DB, repoPath string) (*Service, error) {
 }
 
 // CreateSession creates a new session with worktree and setup commands
-func (s *Service) CreateSession(name string, output io.Writer) (*Session, error) {
-	// Check if session name already exists
-	// Validate name is valid for git branch
+// baseBranch specifies the base for new branches (empty string defaults to HEAD)
+// useExistingBranch when true will attach to an existing branch instead of creating a new one
+func (s *Service) CreateSession(name, baseBranch string, useExistingBranch bool, output io.Writer) (*Session, error) {
 	if err := worktree.ValidateBranchName(name); err != nil {
 		return nil, fmt.Errorf("invalid session name: %w", err)
 	}
@@ -52,8 +52,17 @@ func (s *Service) CreateSession(name string, output io.Writer) (*Session, error)
 		return nil, fmt.Errorf("session with name '%s' already exists", name)
 	}
 
-	// Create session record (name = branch name)
-	session := &Session{
+	if useExistingBranch {
+		existingByBranch, err := s.db.GetSessionByBranchName(name)
+		if err != nil {
+			return nil, fmt.Errorf("failed to check branch: %w", err)
+		}
+		if existingByBranch != nil {
+			return nil, fmt.Errorf("branch '%s' already has a session", name)
+		}
+	}
+
+	sess := &Session{
 		ID:           uuid.New().String(),
 		Name:         name,
 		RepoPath:     s.repoPath,
@@ -64,42 +73,36 @@ func (s *Service) CreateSession(name string, output io.Writer) (*Session, error)
 		Status:       "active",
 	}
 
-	// Create worktree
 	fmt.Fprintf(output, "Creating git worktree...\n")
-	if err := worktree.CreateWorktree(s.repoPath, name, session.BranchName, session.WorktreePath); err != nil {
+	if err := worktree.CreateWorktree(s.repoPath, name, sess.BranchName, sess.WorktreePath, baseBranch, useExistingBranch); err != nil {
 		return nil, fmt.Errorf("failed to create worktree: %w", err)
 	}
 
-	// Load config for setup commands
+	// cleanupWorktree ensures worktree is removed on any subsequent error
+	cleanupWorktree := func() { worktree.DeleteWorktree(sess.WorktreePath) }
+
 	cfg, err := config.Load(s.repoPath)
 	if err != nil {
-		// Clean up worktree on error
-		worktree.DeleteWorktree(session.WorktreePath)
+		cleanupWorktree()
 		return nil, fmt.Errorf("failed to load config: %w", err)
 	}
 
-	// Run setup commands if any
+	fmt.Fprintf(output, "Worktree created\n")
 	if len(cfg.SetupWorktree) > 0 {
-		fmt.Fprintf(output, "✓ Worktree created\n")
 		fmt.Fprintf(output, "Running setup commands...\n")
-		if err := worktree.RunSetupCommands(session.WorktreePath, cfg.SetupWorktree, output); err != nil {
-			// Clean up worktree on error
-			worktree.DeleteWorktree(session.WorktreePath)
+		if err := worktree.RunSetupCommands(sess.WorktreePath, cfg.SetupWorktree, output); err != nil {
+			cleanupWorktree()
 			return nil, fmt.Errorf("setup commands failed: %w", err)
 		}
-		fmt.Fprintf(output, "✓ Setup complete\n")
-	} else {
-		fmt.Fprintf(output, "✓ Worktree created\n")
+		fmt.Fprintf(output, "Setup complete\n")
 	}
 
-	// Save to database
-	if err := s.db.InsertSession(session.toDBSession()); err != nil {
-		// Clean up worktree on error
-		worktree.DeleteWorktree(session.WorktreePath)
+	if err := s.db.InsertSession(sess.toDBSession()); err != nil {
+		cleanupWorktree()
 		return nil, fmt.Errorf("failed to save session: %w", err)
 	}
 
-	return session, nil
+	return sess, nil
 }
 
 // ListSessions returns all sessions, optionally filtered by query
@@ -163,6 +166,28 @@ func (s *Service) UnarchiveSession(name string) error {
 	}
 
 	return s.db.UnarchiveSession(session.ID)
+}
+
+// ListBranches returns all local branches in the repository
+func (s *Service) ListBranches() ([]string, error) {
+	return worktree.ListBranches(s.repoPath)
+}
+
+// GetCurrentBranch returns the current HEAD branch name
+func (s *Service) GetCurrentBranch() (string, error) {
+	return worktree.GetCurrentBranch(s.repoPath)
+}
+
+// GetSessionByBranch returns a session for a given branch name, or nil if none exists
+func (s *Service) GetSessionByBranch(branchName string) (*Session, error) {
+	dbs, err := s.db.GetSessionByBranchName(branchName)
+	if err != nil {
+		return nil, err
+	}
+	if dbs == nil {
+		return nil, nil
+	}
+	return fromDBSession(dbs), nil
 }
 
 // EnterSession prepares to enter a session and returns the command to exec

@@ -20,13 +20,17 @@ const (
 	stateMain state = iota
 	stateCreating
 	stateConfirmDelete
+	stateSelectBaseBranch
+	stateSelectExistingBranch
+	stateConfirmBranchWithSession
+	stateEnterNewSessionName
 )
 
 // Layout constants
 const (
 	appVersion         = "0.1.0"
-	contentWidth       = 71 // Inner width (total 73 - 2 for borders)
-	fixedUILines       = 13 // Lines used by borders, input, dividers, help text
+	contentWidth       = 62 // Inner width (total 64 - 2 for borders)
+	fixedUILines       = 12 // Lines: 2 borders + repo + input + message + 2 dividers + create new + 2 help rows
 	linesPerSession    = 2  // Each session displays name + metadata
 	maxSessionsVisible = 15 // Cap to prevent overly tall box
 	summaryMaxLen      = 35 // Max characters for conversation summary
@@ -50,6 +54,18 @@ type Model struct {
 	commandToExec    string
 	windowHeight     int
 	windowWidth      int
+
+	// Branch selection fields
+	branches             []string          // Available branches
+	filteredBranches     []string          // Branches filtered by search
+	branchInput          textinput.Model   // Text input for branch filtering
+	branchCursor         int               // Cursor for branch selection
+	branchScrollOffset   int               // Scroll offset for branch list
+	pendingSessionName   string            // Session name entered before base branch selection
+	branchesWithSessions map[string]bool   // Tracks which branches already have sessions
+	currentBranch        string            // Current HEAD branch name
+	selectedBranchName   string            // Branch selected that has existing session (for confirmation dialog)
+	newSessionInput      textinput.Model   // Text input for new session name when branching from existing
 }
 
 type sessionsLoadedMsg struct {
@@ -77,7 +93,12 @@ type errMsg struct {
 	err error
 }
 
-func NewModel(service *session.Service, repoName string) *Model {
+type branchesLoadedMsg struct {
+	branches             []string
+	branchesWithSessions map[string]bool
+}
+
+func NewModel(service *session.Service, repoName string, invokingBranch string) *Model {
 	ti := textinput.New()
 	ti.Placeholder = "Type to search or create..."
 	ti.Focus()
@@ -88,12 +109,13 @@ func NewModel(service *session.Service, repoName string) *Model {
 	s.Spinner = spinner.Dot
 
 	return &Model{
-		state:     stateMain,
-		service:   service,
-		repoName:  repoName,
-		textInput: ti,
-		spinner:   s,
-		cursor:    0,
+		state:         stateMain,
+		service:       service,
+		repoName:      repoName,
+		textInput:     ti,
+		spinner:       s,
+		cursor:        0,
+		currentBranch: invokingBranch, // Use the branch from the invoking directory
 	}
 }
 
@@ -115,6 +137,29 @@ func (m *Model) loadSessions() tea.Cmd {
 	}
 }
 
+func (m *Model) loadBranches() tea.Cmd {
+	return func() tea.Msg {
+		branches, err := m.service.ListBranches()
+		if err != nil {
+			return errMsg{err}
+		}
+
+		// Check which branches already have sessions
+		branchesWithSessions := make(map[string]bool)
+		for _, branch := range branches {
+			sess, _ := m.service.GetSessionByBranch(branch)
+			if sess != nil {
+				branchesWithSessions[branch] = true
+			}
+		}
+
+		return branchesLoadedMsg{
+			branches:             branches,
+			branchesWithSessions: branchesWithSessions,
+		}
+	}
+}
+
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -128,6 +173,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case sessionsLoadedMsg:
 		m.sessions = msg.sessions
 		m.filterSessions()
+		return m, nil
+
+	case branchesLoadedMsg:
+		m.branches = msg.branches
+		m.branchesWithSessions = msg.branchesWithSessions
+		m.filterBranches()
 		return m, nil
 
 	case sessionCreatedMsg:
@@ -176,6 +227,14 @@ func (m *Model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case stateCreating:
 		// No input during creation
 		return m, nil
+	case stateSelectBaseBranch:
+		return m.handleSelectBaseBranchKeys(msg)
+	case stateSelectExistingBranch:
+		return m.handleSelectExistingBranchKeys(msg)
+	case stateConfirmBranchWithSession:
+		return m.handleConfirmBranchWithSessionKeys(msg)
+	case stateEnterNewSessionName:
+		return m.handleEnterNewSessionNameKeys(msg)
 	}
 	return m, nil
 }
@@ -208,6 +267,9 @@ func (m *Model) handleMainKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "ctrl+a":
 		return m.handleArchiveToggle()
+
+	case "ctrl+b":
+		return m.handleCreateFromExistingBranch()
 
 	default:
 		// Pass key to text input for typing
@@ -249,12 +311,39 @@ func (m *Model) createSession() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// Validate name before showing branch selection
+	if err := worktree.ValidateBranchName(name); err != nil {
+		m.err = fmt.Errorf("invalid session name: %w", err)
+		return m, nil
+	}
+
+	// Store the pending session name and transition to branch selection
+	m.pendingSessionName = name
+	m.state = stateSelectBaseBranch
+	m.initBranchInput()
+
+	return m, m.loadBranches()
+}
+
+// initBranchInput creates and initializes the branch filter input
+func (m *Model) initBranchInput() {
+	m.branchInput = textinput.New()
+	m.branchInput.Placeholder = "Type to filter branches..."
+	m.branchInput.Focus()
+	m.branchInput.CharLimit = 100
+	m.branchInput.Width = 50
+	m.branchCursor = 0
+	m.branchScrollOffset = 0
+}
+
+func (m *Model) doCreateSession(baseBranch string, useExisting bool) tea.Cmd {
+	name := m.pendingSessionName
 	m.state = stateCreating
 	m.createOutput = ""
 
-	return m, func() tea.Msg {
+	return func() tea.Msg {
 		var buf bytes.Buffer
-		session, err := m.service.CreateSession(name, &buf)
+		session, err := m.service.CreateSession(name, baseBranch, useExisting, &buf)
 		if err != nil {
 			return errMsg{err}
 		}
@@ -333,6 +422,281 @@ func (m *Model) handleDeleteConfirmKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m *Model) handleCreateFromExistingBranch() (tea.Model, tea.Cmd) {
+	m.state = stateSelectExistingBranch
+	m.initBranchInput()
+
+	return m, m.loadBranches()
+}
+
+// showHeadOption returns true if the HEAD option should be visible in the branch list
+func (m *Model) showHeadOption() bool {
+	filter := strings.ToLower(m.branchInput.Value())
+	return filter == "" || strings.Contains("head", filter)
+}
+
+func (m *Model) handleSelectBaseBranchKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	showHead := m.showHeadOption()
+	totalItems := len(m.filteredBranches)
+	if showHead {
+		totalItems++
+	}
+
+	switch msg.String() {
+	case "ctrl+c", "esc":
+		m.state = stateMain
+		m.pendingSessionName = ""
+		return m, nil
+
+	case "up":
+		if m.branchCursor > 0 {
+			m.branchCursor--
+			m.adjustBranchScroll(totalItems)
+		}
+		return m, nil
+
+	case "down":
+		if m.branchCursor < totalItems-1 {
+			m.branchCursor++
+			m.adjustBranchScroll(totalItems)
+		}
+		return m, nil
+
+	case "enter":
+		if totalItems == 0 {
+			return m, nil
+		}
+		baseBranch := m.getSelectedBaseBranch(showHead)
+		if baseBranch == "" {
+			return m, nil
+		}
+		return m, m.doCreateSession(baseBranch, false)
+
+	default:
+		var cmd tea.Cmd
+		m.branchInput, cmd = m.branchInput.Update(msg)
+		m.filterBranches()
+		m.clampBranchCursor()
+		return m, cmd
+	}
+}
+
+// getSelectedBaseBranch returns the branch name for the current cursor position
+func (m *Model) getSelectedBaseBranch(showHead bool) string {
+	if showHead && m.branchCursor == 0 {
+		return "HEAD"
+	}
+	branchIdx := m.branchCursor
+	if showHead {
+		branchIdx--
+	}
+	if branchIdx >= 0 && branchIdx < len(m.filteredBranches) {
+		return m.filteredBranches[branchIdx]
+	}
+	return ""
+}
+
+// clampBranchCursor ensures the branch cursor stays within valid bounds
+func (m *Model) clampBranchCursor() {
+	total := len(m.filteredBranches)
+	if m.showHeadOption() {
+		total++
+	}
+	if m.branchCursor >= total {
+		m.branchCursor = total - 1
+	}
+	if m.branchCursor < 0 {
+		m.branchCursor = 0
+	}
+}
+
+func (m *Model) handleSelectExistingBranchKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	totalItems := len(m.filteredBranches)
+
+	switch msg.String() {
+	case "ctrl+c", "esc":
+		m.state = stateMain
+		return m, nil
+
+	case "up":
+		if m.branchCursor > 0 {
+			m.branchCursor--
+			m.adjustBranchScroll(totalItems)
+		}
+		return m, nil
+
+	case "down":
+		if m.branchCursor < totalItems-1 {
+			m.branchCursor++
+			m.adjustBranchScroll(totalItems)
+		}
+		return m, nil
+
+	case "enter":
+		if totalItems == 0 || m.branchCursor >= totalItems {
+			return m, nil
+		}
+		selectedBranch := m.filteredBranches[m.branchCursor]
+
+		if m.branchesWithSessions[selectedBranch] {
+			m.selectedBranchName = selectedBranch
+			m.state = stateConfirmBranchWithSession
+			return m, nil
+		}
+
+		m.pendingSessionName = selectedBranch
+		return m, m.doCreateSession(selectedBranch, true)
+
+	default:
+		var cmd tea.Cmd
+		m.branchInput, cmd = m.branchInput.Update(msg)
+		m.filterBranches()
+		m.clampExistingBranchCursor()
+		return m, cmd
+	}
+}
+
+// clampExistingBranchCursor ensures the cursor stays within filtered branch bounds
+func (m *Model) clampExistingBranchCursor() {
+	if m.branchCursor >= len(m.filteredBranches) {
+		m.branchCursor = len(m.filteredBranches) - 1
+	}
+	if m.branchCursor < 0 {
+		m.branchCursor = 0
+	}
+}
+
+func (m *Model) handleConfirmBranchWithSessionKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "y", "Y":
+		// User wants to create a new session from this branch
+		// Transition to new session name input
+		m.newSessionInput = textinput.New()
+		m.newSessionInput.Placeholder = "Enter new session name..."
+		m.newSessionInput.Focus()
+		m.newSessionInput.CharLimit = 100
+		m.newSessionInput.Width = 50
+		m.state = stateEnterNewSessionName
+		return m, nil
+
+	case "n", "N", "esc":
+		// Go back to branch selection
+		m.state = stateSelectExistingBranch
+		m.selectedBranchName = ""
+		return m, nil
+
+	case "ctrl+c":
+		return m, tea.Quit
+	}
+	return m, nil
+}
+
+func (m *Model) handleEnterNewSessionNameKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+
+	case "esc":
+		// Go back to branch selection
+		m.state = stateSelectExistingBranch
+		m.selectedBranchName = ""
+		return m, nil
+
+	case "enter":
+		name := strings.TrimSpace(m.newSessionInput.Value())
+		if name == "" {
+			m.err = fmt.Errorf("session name cannot be empty")
+			return m, nil
+		}
+
+		// Validate name
+		if err := worktree.ValidateBranchName(name); err != nil {
+			m.err = fmt.Errorf("invalid session name: %w", err)
+			return m, nil
+		}
+
+		// Create session with new branch from the selected branch
+		m.pendingSessionName = name
+		return m, m.doCreateSession(m.selectedBranchName, false) // false = create new branch
+
+	default:
+		// Pass key to text input
+		var cmd tea.Cmd
+		m.newSessionInput, cmd = m.newSessionInput.Update(msg)
+		m.err = nil // Clear error on typing
+		return m, cmd
+	}
+}
+
+// filterBranches filters branches based on the branch input query
+func (m *Model) filterBranches() {
+	query := strings.ToLower(strings.TrimSpace(m.branchInput.Value()))
+
+	if query == "" {
+		m.filteredBranches = m.branches
+	} else {
+		m.filteredBranches = []string{}
+		for _, branch := range m.branches {
+			if strings.Contains(strings.ToLower(branch), query) {
+				m.filteredBranches = append(m.filteredBranches, branch)
+			}
+		}
+	}
+
+	// Clamp cursor to valid range
+	maxCursor := len(m.filteredBranches)
+	if m.state == stateSelectBaseBranch {
+		// +1 for HEAD option in base branch selection
+		if m.branchCursor > maxCursor {
+			m.branchCursor = maxCursor
+		}
+	} else {
+		// For existing branch selection, all branches are selectable
+		if m.branchCursor >= maxCursor {
+			m.branchCursor = maxCursor - 1
+			if m.branchCursor < 0 {
+				m.branchCursor = 0
+			}
+		}
+	}
+	m.branchScrollOffset = 0
+}
+
+// adjustBranchScroll ensures the branch cursor is visible within the scroll window
+func (m *Model) adjustBranchScroll(totalItems int) {
+	maxVisible := m.maxVisibleBranches()
+	if maxVisible <= 0 {
+		maxVisible = 1
+	}
+
+	if m.branchCursor < m.branchScrollOffset {
+		m.branchScrollOffset = m.branchCursor
+	}
+
+	if m.branchCursor >= m.branchScrollOffset+maxVisible {
+		m.branchScrollOffset = m.branchCursor - maxVisible + 1
+	}
+
+	if m.branchScrollOffset < 0 {
+		m.branchScrollOffset = 0
+	}
+}
+
+// maxVisibleBranches returns how many branches can fit in the terminal
+func (m *Model) maxVisibleBranches() int {
+	if m.windowHeight <= fixedUILines {
+		return 1
+	}
+	availableLines := m.windowHeight - fixedUILines
+	// Each branch is 1 line
+	maxBranches := availableLines
+
+	if maxBranches > maxSessionsVisible {
+		maxBranches = maxSessionsVisible
+	}
+	return maxBranches
+}
+
 func (m *Model) filterSessions() {
 	query := strings.ToLower(strings.TrimSpace(m.textInput.Value()))
 
@@ -404,6 +768,14 @@ func (m *Model) View() string {
 		return m.viewCreating()
 	case stateConfirmDelete:
 		return m.viewConfirmDelete()
+	case stateSelectBaseBranch:
+		return m.viewSelectBaseBranch()
+	case stateSelectExistingBranch:
+		return m.viewSelectExistingBranch()
+	case stateConfirmBranchWithSession:
+		return m.viewConfirmBranchWithSession()
+	case stateEnterNewSessionName:
+		return m.viewEnterNewSessionName()
 	}
 	return ""
 }
@@ -423,21 +795,17 @@ func (m *Model) viewMain() string {
 	content.WriteString(strings.Repeat(" ", repoNamePadding) + repoNameStyled + "\n")
 	// Input
 	content.WriteString(pad + m.textInput.View() + "\n")
-	// Padding line after input
-	content.WriteString(pad + "\n")
-	// Divider before session list
-	content.WriteString(divider + "\n")
-	// Padding line
-	content.WriteString(pad + "\n")
-
-	// Error/Message
+	// Error/Message right under search bar (always reserve this line for consistent height)
 	if m.err != nil {
 		content.WriteString(pad + errorStyle.Render(fmt.Sprintf("Error: %s", m.err.Error())))
-		content.WriteString("\n")
 	} else if m.message != "" {
 		content.WriteString(pad + successStyle.Render(m.message))
-		content.WriteString("\n")
+	} else {
+		content.WriteString(pad)
 	}
+	content.WriteString("\n")
+	// Divider before session list
+	content.WriteString(divider + "\n")
 
 	// "Create new" option (always visible, position 0)
 	createNewText := fmt.Sprintf("+ New session \"%s\"", m.textInput.Value())
@@ -475,7 +843,12 @@ func (m *Model) viewMain() string {
 	}
 
 	// Add padding lines to fill terminal height (each session is 2 lines)
-	paddingNeeded := (maxVisible - sessionsRendered) * 2
+	paddingNeeded := (maxVisible - sessionsRendered) * linesPerSession
+	// Account for remainder when available lines is odd
+	availableLines := m.windowHeight - fixedUILines
+	if availableLines > 0 && availableLines%linesPerSession != 0 {
+		paddingNeeded += availableLines % linesPerSession
+	}
 	for i := 0; i < paddingNeeded; i++ {
 		content.WriteString(pad + "\n")
 	}
@@ -487,12 +860,12 @@ func (m *Model) viewMain() string {
 		content.WriteString(pad) // Reserve space
 	}
 	content.WriteString("\n")
-	// Padding line between list and divider
-	content.WriteString(pad + "\n")
 
-	// Help text (divider then instructions, no gap between)
+	// Help text (divider then instructions on two rows)
 	content.WriteString(divider + "\n")
-	content.WriteString(pad + helpStyle.Render("[↑/↓] Navigate  [Enter] Select  [^D] Delete  [^A] Archive  [Esc] Quit"))
+	content.WriteString(pad + helpStyle.Render("[↑/↓] Navigate  [Enter] Select  [^B] From branch"))
+	content.WriteString("\n")
+	content.WriteString(pad + helpStyle.Render("[^D] Delete  [^A] Archive  [Esc] Quit"))
 	content.WriteString("\n")
 
 	// Build the box manually for full control (no lipgloss border)
@@ -500,7 +873,12 @@ func (m *Model) viewMain() string {
 	// Top border with embedded title
 	title := titleStyle.Render("🛫 Air Traffic Control") + " " + subtitleStyle.Render("v"+appVersion)
 	topLeft := borderStyle.Render("╭─ ")
-	topRight := borderStyle.Render(" ───────────────────────────────────────╮")
+	titleWidth := lipgloss.Width(topLeft) + lipgloss.Width(title) + 2 // +2 for space and closing corner
+	dashCount := contentWidth - titleWidth + 2                        // +2 for side borders
+	if dashCount < 1 {
+		dashCount = 1
+	}
+	topRight := borderStyle.Render(" " + strings.Repeat("─", dashCount) + "╮")
 	topBorder := topLeft + title + topRight
 
 	// Wrap each content line with side borders
@@ -617,6 +995,241 @@ func (m *Model) viewConfirmDelete() string {
 	b.WriteString(dialogTextStyle.Render("[Y] Yes, delete    [N] Cancel"))
 
 	return dialogBoxStyle.Render(b.String())
+}
+
+func (m *Model) viewSelectBaseBranch() string {
+	var content strings.Builder
+	divider := dividerStyle.Render(strings.Repeat("─", contentWidth))
+	pad := " "
+
+	titleLine := fmt.Sprintf("Creating session \"%s\"", m.pendingSessionName)
+	content.WriteString(pad + titleStyle.Render(titleLine) + "\n")
+	content.WriteString(pad + subtitleStyle.Render("Select base branch:") + "\n")
+	content.WriteString(pad + m.branchInput.View() + "\n")
+	content.WriteString(pad + "\n")
+	content.WriteString(divider + "\n")
+	content.WriteString(pad + "\n")
+
+	showHead := m.showHeadOption()
+	if showHead {
+		headLabel := fmt.Sprintf("HEAD (%s)", m.currentBranch)
+		if m.branchCursor == 0 {
+			content.WriteString(pad + selectedItemStyle.Render("▶ "+headLabel) + "\n")
+		} else {
+			content.WriteString(pad + normalItemStyle.Render("  "+headLabel) + "\n")
+		}
+	}
+
+	// Calculate visible range for branches
+	maxVisible := m.maxVisibleBranches() - 1 // -1 for HEAD option
+	if maxVisible < 1 {
+		maxVisible = 1
+	}
+	totalBranches := len(m.filteredBranches)
+
+	// Adjust scroll for branch list (cursor 1+ maps to branches, or 0+ if HEAD hidden)
+	cursorOffset := 0
+	if showHead {
+		cursorOffset = 1
+	}
+	branchCursor := m.branchCursor - cursorOffset // Convert to branch index
+	startIdx := m.branchScrollOffset
+	if branchCursor >= 0 {
+		if branchCursor < startIdx {
+			startIdx = branchCursor
+		}
+		if branchCursor >= startIdx+maxVisible {
+			startIdx = branchCursor - maxVisible + 1
+		}
+	}
+	endIdx := startIdx + maxVisible
+	if endIdx > totalBranches {
+		endIdx = totalBranches
+	}
+
+	// Scroll up indicator
+	if startIdx > 0 {
+		content.WriteString(pad + metadataStyle.Render(fmt.Sprintf("  ↑ %d more", startIdx)) + "\n")
+	}
+
+	// Render visible branches
+	for i := startIdx; i < endIdx; i++ {
+		branch := m.filteredBranches[i]
+		cursorPos := i + cursorOffset // Adjust for HEAD option
+		if m.branchCursor == cursorPos {
+			content.WriteString(pad + selectedItemStyle.Render("▶ "+branch) + "\n")
+		} else {
+			content.WriteString(pad + normalItemStyle.Render("  "+branch) + "\n")
+		}
+	}
+
+	// Scroll down indicator
+	if endIdx < totalBranches {
+		content.WriteString(pad + metadataStyle.Render(fmt.Sprintf("  ↓ %d more", totalBranches-endIdx)) + "\n")
+	}
+
+	content.WriteString(pad + "\n")
+	content.WriteString(divider + "\n")
+	content.WriteString(pad + helpStyle.Render("[↑/↓] Navigate  [Enter] Select  [Esc] Cancel") + "\n")
+
+	return m.wrapInBox(content.String())
+}
+
+func (m *Model) viewSelectExistingBranch() string {
+	var content strings.Builder
+	divider := dividerStyle.Render(strings.Repeat("─", contentWidth))
+	pad := " "
+
+	// Title and input
+	content.WriteString(pad + titleStyle.Render("Create session from existing branch:") + "\n")
+	content.WriteString(pad + m.branchInput.View() + "\n")
+	content.WriteString(divider + "\n")
+
+	// Calculate how many branches we can show
+	// Fixed lines: title(1) + input(1) + divider(1) + divider(1) + help(1) + borders(2) = 8
+	branchAreaHeight := m.windowHeight - 8
+	if branchAreaHeight < 1 {
+		branchAreaHeight = 1
+	}
+	if branchAreaHeight > maxSessionsVisible {
+		branchAreaHeight = maxSessionsVisible
+	}
+
+	totalBranches := len(m.filteredBranches)
+
+	if totalBranches == 0 {
+		content.WriteString(pad + metadataStyle.Render("  No branches match filter") + "\n")
+	} else {
+		// Calculate scroll window
+		startIdx := m.branchScrollOffset
+		if m.branchCursor < startIdx {
+			startIdx = m.branchCursor
+		}
+		if m.branchCursor >= startIdx+branchAreaHeight {
+			startIdx = m.branchCursor - branchAreaHeight + 1
+		}
+		if startIdx < 0 {
+			startIdx = 0
+		}
+		endIdx := startIdx + branchAreaHeight
+		if endIdx > totalBranches {
+			endIdx = totalBranches
+		}
+
+		// Scroll up indicator
+		if startIdx > 0 {
+			content.WriteString(pad + metadataStyle.Render(fmt.Sprintf("  ↑ %d more", startIdx)) + "\n")
+		}
+
+		// Render visible branches
+		for i := startIdx; i < endIdx; i++ {
+			branch := m.filteredBranches[i]
+			hasSession := m.branchesWithSessions[branch]
+
+			displayName := branch
+			if hasSession {
+				displayName = "● " + branch
+			}
+
+			if m.branchCursor == i {
+				content.WriteString(pad + selectedItemStyle.Render("▶ "+displayName) + "\n")
+			} else {
+				content.WriteString(pad + normalItemStyle.Render("  "+displayName) + "\n")
+			}
+		}
+
+		// Scroll down indicator
+		if endIdx < totalBranches {
+			content.WriteString(pad + metadataStyle.Render(fmt.Sprintf("  ↓ %d more", totalBranches-endIdx)) + "\n")
+		}
+	}
+
+	content.WriteString(divider + "\n")
+	content.WriteString(pad + helpStyle.Render("[↑/↓] Navigate  [Enter] Select  [Esc] Cancel  ● has session"))
+
+	return m.wrapInBox(content.String())
+}
+
+func (m *Model) viewConfirmBranchWithSession() string {
+	var b strings.Builder
+
+	b.WriteString(dialogTitleStyle.Render("Branch Has Existing Session"))
+	b.WriteString("\n\n")
+
+	b.WriteString(dialogTextStyle.Render(fmt.Sprintf("Branch \"%s\" already has a session.", m.selectedBranchName)))
+	b.WriteString("\n\n")
+
+	b.WriteString(dialogTextStyle.Render("Would you like to create a new session"))
+	b.WriteString("\n")
+	b.WriteString(dialogTextStyle.Render("branching from this branch?"))
+	b.WriteString("\n\n")
+
+	b.WriteString(dialogTextStyle.Render("[Y] Yes, create new branch    [N] Cancel"))
+
+	return dialogBoxStyle.Render(b.String())
+}
+
+func (m *Model) viewEnterNewSessionName() string {
+	var content strings.Builder
+	divider := dividerStyle.Render(strings.Repeat("─", contentWidth))
+	pad := " "
+
+	// Title
+	content.WriteString(pad + titleStyle.Render(fmt.Sprintf("New session from \"%s\"", m.selectedBranchName)) + "\n")
+	content.WriteString(pad + subtitleStyle.Render("Enter a name for the new session:") + "\n")
+	content.WriteString(pad + "\n")
+
+	// Input
+	content.WriteString(pad + m.newSessionInput.View() + "\n")
+	content.WriteString(pad + "\n")
+
+	// Error if any
+	if m.err != nil {
+		content.WriteString(pad + errorStyle.Render(fmt.Sprintf("Error: %s", m.err.Error())) + "\n")
+		content.WriteString(pad + "\n")
+	}
+
+	content.WriteString(divider + "\n")
+	content.WriteString(pad + helpStyle.Render("[Enter] Create  [Esc] Cancel") + "\n")
+
+	return m.wrapInBox(content.String())
+}
+
+// wrapInBox wraps content in the standard ATC border box
+func (m *Model) wrapInBox(content string) string {
+	// Top border with embedded title
+	title := titleStyle.Render("🛫 Air Traffic Control") + " " + subtitleStyle.Render("v"+appVersion)
+	topLeft := borderStyle.Render("╭─ ")
+	titleWidth := lipgloss.Width(topLeft) + lipgloss.Width(title) + 2 // +2 for space and closing corner
+	dashCount := contentWidth - titleWidth + 2                        // +2 for side borders
+	if dashCount < 1 {
+		dashCount = 1
+	}
+	topRight := borderStyle.Render(" " + strings.Repeat("─", dashCount) + "╮")
+	topBorder := topLeft + title + topRight
+
+	// Wrap each content line with side borders
+	lines := strings.Split(content, "\n")
+	var body strings.Builder
+	body.WriteString(topBorder + "\n")
+	leftBorder := borderStyle.Render("│")
+	rightBorder := borderStyle.Render("│")
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		visualWidth := lipgloss.Width(line)
+		padding := contentWidth - visualWidth
+		if padding < 0 {
+			padding = 0
+		}
+		body.WriteString(leftBorder + line + strings.Repeat(" ", padding) + rightBorder + "\n")
+	}
+
+	// Bottom border
+	body.WriteString(borderStyle.Render("╰" + strings.Repeat("─", contentWidth) + "╯"))
+
+	return body.String()
 }
 
 func formatTime(t time.Time) string {

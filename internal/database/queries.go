@@ -2,6 +2,7 @@ package database
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -54,7 +55,7 @@ func (db *DB) GetSessionByID(id string) (*Session, error) {
 		&s.ID, &s.Name, &s.RepoPath, &s.RepoName, &s.WorktreePath, &s.BranchName,
 		&s.CreatedAt, &s.LastAccessed, &s.ArchivedAt, &s.Status,
 	)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("session not found")
 	}
 	if err != nil {
@@ -77,11 +78,34 @@ func (db *DB) GetSessionByName(name string) (*Session, error) {
 		&s.ID, &s.Name, &s.RepoPath, &s.RepoName, &s.WorktreePath, &s.BranchName,
 		&s.CreatedAt, &s.LastAccessed, &s.ArchivedAt, &s.Status,
 	)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("session not found")
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to get session: %w", err)
+	}
+	return &s, nil
+}
+
+// GetSessionByBranchName retrieves a session by its branch name
+func (db *DB) GetSessionByBranchName(branchName string) (*Session, error) {
+	query := `
+		SELECT id, name, repo_path, repo_name, worktree_path, branch_name,
+		       created_at, last_accessed, archived_at, status
+		FROM sessions
+		WHERE branch_name = ?
+	`
+
+	var s Session
+	err := db.conn.QueryRow(query, branchName).Scan(
+		&s.ID, &s.Name, &s.RepoPath, &s.RepoName, &s.WorktreePath, &s.BranchName,
+		&s.CreatedAt, &s.LastAccessed, &s.ArchivedAt, &s.Status,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil // Return nil, nil when not found (branch has no session)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to get session by branch: %w", err)
 	}
 	return &s, nil
 }
