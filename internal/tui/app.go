@@ -26,9 +26,11 @@ const (
 	stateEnterNewSessionName
 )
 
+// Version is set via ldflags at build time
+var Version = "dev"
+
 // Layout constants
 const (
-	appVersion         = "0.1.0"
 	contentWidth       = 62 // Inner width (total 64 - 2 for borders)
 	fixedUILines       = 12 // Lines: 2 borders + repo + input + message + 2 dividers + create new + 2 help rows
 	linesPerSession    = 2  // Each session displays name + metadata
@@ -871,7 +873,7 @@ func (m *Model) viewMain() string {
 	// Build the box manually for full control (no lipgloss border)
 
 	// Top border with embedded title
-	title := titleStyle.Render("🛫 Air Traffic Control") + " " + subtitleStyle.Render("v"+appVersion)
+	title := titleStyle.Render("🛫 Air Traffic Control") + " " + subtitleStyle.Render("v"+Version)
 	topLeft := borderStyle.Render("╭─ ")
 	titleWidth := lipgloss.Width(topLeft) + lipgloss.Width(title) + 2 // +2 for space and closing corner
 	dashCount := contentWidth - titleWidth + 2                        // +2 for side borders
@@ -1198,7 +1200,7 @@ func (m *Model) viewEnterNewSessionName() string {
 // wrapInBox wraps content in the standard ATC border box
 func (m *Model) wrapInBox(content string) string {
 	// Top border with embedded title
-	title := titleStyle.Render("🛫 Air Traffic Control") + " " + subtitleStyle.Render("v"+appVersion)
+	title := titleStyle.Render("🛫 Air Traffic Control") + " " + subtitleStyle.Render("v"+Version)
 	topLeft := borderStyle.Render("╭─ ")
 	titleWidth := lipgloss.Width(topLeft) + lipgloss.Width(title) + 2 // +2 for space and closing corner
 	dashCount := contentWidth - titleWidth + 2                        // +2 for side borders
