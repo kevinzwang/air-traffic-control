@@ -1,0 +1,120 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux-amd64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        run: |
+          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -ldflags "-X 'github.com/kevinzwang/air-traffic-control/internal/tui.Version=${{ github.ref_name }}'" -o atc-linux-amd64 ./cmd/atc
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: atc-linux-amd64
+          path: atc-linux-amd64
+
+  build-linux-arm64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install cross-compiler
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build
+        run: |
+          CGO_ENABLED=1 CC=aarch64-linux-gnu-gcc GOOS=linux GOARCH=arm64 go build -ldflags "-X 'github.com/kevinzwang/air-traffic-control/internal/tui.Version=${{ github.ref_name }}'" -o atc-linux-arm64 ./cmd/atc
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: atc-linux-arm64
+          path: atc-linux-arm64
+
+  build-darwin:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build amd64
+        run: |
+          CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 go build -ldflags "-X 'github.com/kevinzwang/air-traffic-control/internal/tui.Version=${{ github.ref_name }}'" -o atc-darwin-amd64 ./cmd/atc
+
+      - name: Build arm64
+        run: |
+          CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 go build -ldflags "-X 'github.com/kevinzwang/air-traffic-control/internal/tui.Version=${{ github.ref_name }}'" -o atc-darwin-arm64 ./cmd/atc
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: atc-darwin-amd64
+          path: atc-darwin-amd64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: atc-darwin-arm64
+          path: atc-darwin-arm64
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        run: |
+          $env:CGO_ENABLED=1
+          go build -ldflags "-X 'github.com/kevinzwang/air-traffic-control/internal/tui.Version=${{ github.ref_name }}'" -o atc-windows-amd64.exe ./cmd/atc
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: atc-windows-amd64
+          path: atc-windows-amd64.exe
+
+  release:
+    needs: [build-linux-amd64, build-linux-arm64, build-darwin, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release files
+        run: |
+          mkdir release
+          cp artifacts/atc-linux-amd64/atc-linux-amd64 release/
+          cp artifacts/atc-linux-arm64/atc-linux-arm64 release/
+          cp artifacts/atc-darwin-amd64/atc-darwin-amd64 release/
+          cp artifacts/atc-darwin-arm64/atc-darwin-arm64 release/
+          cp artifacts/atc-windows-amd64/atc-windows-amd64.exe release/
+          cd release
+          sha256sum * > checksums.txt
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true

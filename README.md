@@ -1,4 +1,4 @@
-# Air Traffic Control (ATC)
+# ✈️ Air Traffic Control (ATC)
 
 A CLI/TUI tool for managing multiple Claude Code agent sessions in separate git worktrees.
 
@@ -13,29 +13,37 @@ A CLI/TUI tool for managing multiple Claude Code agent sessions in separate git 
 
 ## Installation
 
-### Prerequisites
+### Quick Install (macOS/Linux)
 
-- Go 1.21 or later
-- Git
-- Claude Code CLI (`claude`)
+```bash
+curl -fsSL https://raw.githubusercontent.com/kevinzwang/air-traffic-control/main/scripts/install.sh | bash
+```
+
+This installs the latest release to `~/.local/bin/atc`. Options:
+
+```bash
+# Install specific version
+curl -fsSL https://raw.githubusercontent.com/kevinzwang/air-traffic-control/main/scripts/install.sh | bash -s -- --version v1.0.0
+
+# Install to custom directory
+curl -fsSL https://raw.githubusercontent.com/kevinzwang/air-traffic-control/main/scripts/install.sh | bash -s -- --install-dir /usr/local/bin
+```
 
 ### Build from Source
+
+Prerequisites: Go 1.21+, Git
 
 ```bash
 git clone https://github.com/kevinzwang/air-traffic-control.git
 cd air-traffic-control
 go build -o atc ./cmd/atc
+mv atc ~/.local/bin/  # or /usr/local/bin/
 ```
 
-### Install
+### Prerequisites
 
-Move the binary to your PATH:
-
-```bash
-mv atc /usr/local/bin/atc
-# or
-sudo cp atc /usr/local/bin/atc
-```
+- Git
+- Claude Code CLI (`claude`)
 
 ## Usage
 
