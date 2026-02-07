@@ -21,6 +21,11 @@ func main() {
 }
 
 func run() error {
+	// Check that tmux is available
+	if _, err := exec.LookPath("tmux"); err != nil {
+		return fmt.Errorf("tmux is required but not found in PATH. Install it with: brew install tmux")
+	}
+
 	// Get current directory (should be a git repo)
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -61,25 +66,19 @@ func run() error {
 	// Extract repo name for display
 	repoName := filepath.Base(repoPath)
 
-	// Get current branch from the invoking directory (may differ from main repo if in worktree)
+	// Get current branch from the invoking directory
 	invokingBranch, err := getCurrentBranch(cwd)
 	if err != nil {
-		invokingBranch = "HEAD" // Fallback
+		invokingBranch = "HEAD"
 	}
 
 	// Launch TUI
 	model := tui.NewModel(service, repoName, invokingBranch)
-	p := tea.NewProgram(model, tea.WithAltScreen())
+	p := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
+	model.SetProgram(p)
 
-	finalModel, err := p.Run()
-	if err != nil {
+	if _, err := p.Run(); err != nil {
 		return fmt.Errorf("TUI error: %w", err)
-	}
-
-	// Check if we need to exec into a session
-	m := finalModel.(*tui.Model)
-	if cmd := m.GetCommandToExec(); cmd != "" {
-		return execCommand(cmd)
 	}
 
 	return nil
@@ -114,13 +113,10 @@ func getGitRoot(dir string) (string, error) {
 	gitDir := strings.TrimSpace(string(gitDirOutput))
 
 	// If they differ, we're in a worktree - use the main repo path
-	// commonDir will be like "/path/to/main-repo/.git"
 	if commonDir != gitDir {
-		// Remove the /.git suffix to get the main repo path
 		if strings.HasSuffix(commonDir, "/.git") {
 			return strings.TrimSuffix(commonDir, "/.git"), nil
 		}
-		// Handle case where commonDir is just ".git" (relative path)
 		if commonDir == ".git" {
 			// Fall through to use --show-toplevel
 		} else {
@@ -147,17 +143,4 @@ func getCurrentBranch(dir string) (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(string(output)), nil
-}
-
-// execCommand replaces the current process with the given shell command
-func execCommand(cmdStr string) error {
-	fmt.Printf("\nEntering session...\n")
-
-	// Use bash to execute the command
-	cmd := exec.Command("bash", "-c", cmdStr)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	return cmd.Run()
 }

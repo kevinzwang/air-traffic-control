@@ -2,81 +2,59 @@ package tui
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"fmt"
+	"os/exec"
+	"regexp"
+	"runtime"
 	"strings"
-	"time"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/kevinzwang/air-traffic-control/internal/session"
+	"github.com/kevinzwang/air-traffic-control/internal/terminal"
 	"github.com/kevinzwang/air-traffic-control/internal/worktree"
 )
 
-type state int
-
-const (
-	stateMain state = iota
-	stateCreating
-	stateConfirmDelete
-	stateSelectBaseBranch
-	stateSelectExistingBranch
-	stateConfirmBranchWithSession
-	stateEnterNewSessionName
-)
+var ansiRegex = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]|\x1b\([A-Za-z]`)
 
 // Version is set via ldflags at build time
 var Version = "dev"
 
-// Layout constants
+// Focus state
+type focus int
+
 const (
-	contentWidth       = 62 // Inner width (total 64 - 2 for borders)
-	fixedUILines       = 12 // Lines: 2 borders + repo + input + message + 2 dividers + create new + 2 help rows
-	linesPerSession    = 2  // Each session displays name + metadata
-	maxSessionsVisible = 15 // Cap to prevent overly tall box
-	summaryMaxLen      = 35 // Max characters for conversation summary
-	summaryTruncateAt  = 32 // Where to truncate before adding "..."
+	focusSidebar focus = iota
+	focusTerminal
 )
 
-type Model struct {
-	state            state
-	service          *session.Service
-	repoName         string
-	sessions         []*session.Session
-	filteredSessions []*session.Session
-	textInput        textinput.Model
-	cursor           int
-	scrollOffset     int
-	spinner          spinner.Model
-	err              error
-	message          string
-	selectedSession  *session.Session
-	createOutput     string
-	commandToExec    string
-	windowHeight     int
-	windowWidth      int
+// Overlay state
+type overlay int
 
-	// Branch selection fields
-	branches             []string          // Available branches
-	filteredBranches     []string          // Branches filtered by search
-	branchInput          textinput.Model   // Text input for branch filtering
-	branchCursor         int               // Cursor for branch selection
-	branchScrollOffset   int               // Scroll offset for branch list
-	pendingSessionName   string            // Session name entered before base branch selection
-	branchesWithSessions map[string]bool   // Tracks which branches already have sessions
-	currentBranch        string            // Current HEAD branch name
-	selectedBranchName   string            // Branch selected that has existing session (for confirmation dialog)
-	newSessionInput      textinput.Model   // Text input for new session name when branching from existing
-}
+const (
+	overlayNone overlay = iota
+	overlayCreateSession
+	overlaySelectBaseBranch
+	overlaySelectExistingBranch
+	overlayConfirmBranchWithSession
+	overlayEnterNewSessionName
+	overlayDeleteConfirm
+	overlayHelp
+	overlayCreating
+	overlayArchivedSessions
+)
 
+// Custom messages
 type sessionsLoadedMsg struct {
 	sessions []*session.Session
 }
 
 type sessionCreatedMsg struct {
 	session *session.Session
-	output  string
 }
 
 type sessionDeletedMsg struct {
@@ -100,34 +78,108 @@ type branchesLoadedMsg struct {
 	branchesWithSessions map[string]bool
 }
 
-func NewModel(service *session.Service, repoName string, invokingBranch string) *Model {
-	ti := textinput.New()
-	ti.Placeholder = "Type to search or create..."
-	ti.Focus()
-	ti.CharLimit = 100
-	ti.Width = 50
+type Model struct {
+	// Core state
+	focus         focus
+	overlay       overlay
+	service       *session.Service
+	repoName      string
+	sessions      []*session.Session
+	cursor        int
+	scrollOffset  int
+	activeSession *session.Session // Currently viewed session
 
+	// Terminal instances (session name -> Terminal)
+	terminals  map[string]*terminal.Terminal
+	program    *tea.Program
+	tmuxSocket string
+
+	// Window dimensions
+	windowWidth  int
+	windowHeight int
+
+	// Archived sessions overlay
+	archivedCursor       int
+	archivedScrollOffset int
+	archivedList         []*session.Session
+	deleteFromArchived   bool
+
+	// Spinner for creating state
+	spinner spinner.Model
+	err     error
+	message string
+
+	// Session creation fields
+	createInput        textinput.Model
+	pendingSessionName string
+	selectAfterLoad    string // session name to select after next sessionsLoadedMsg
+	activatingSession  string // session name currently being activated (to prevent double-create)
+
+	// Branch selection fields
+	branches             []string
+	filteredBranches     []string
+	branchInput          textinput.Model
+	branchCursor         int
+	branchScrollOffset   int
+	branchesWithSessions map[string]bool
+	currentBranch        string
+	selectedBranchName   string
+	newSessionInput      textinput.Model
+
+	// Delete confirmation
+	selectedSession *session.Session
+
+	// Text selection state
+	selecting    bool // currently dragging
+	selStartCol  int  // terminal-relative column where drag started
+	selStartRow  int  // terminal-relative row where drag started
+	selEndCol    int  // current drag column
+	selEndRow    int  // current drag row
+	hasSelection bool // selection is visible
+}
+
+func NewModel(service *session.Service, repoName string, invokingBranch string) *Model {
 	s := spinner.New()
 	s.Spinner = spinner.Dot
 
+	// Stable socket name based on repo path so tmux sessions persist across ATC restarts
+	hash := sha256.Sum256([]byte(service.RepoPath()))
+	tmuxSocket := fmt.Sprintf("atc-%x", hash[:4])
+
 	return &Model{
-		state:         stateMain,
+		focus:         focusSidebar,
+		overlay:       overlayNone,
 		service:       service,
 		repoName:      repoName,
-		textInput:     ti,
 		spinner:       s,
-		cursor:        0,
-		currentBranch: invokingBranch, // Use the branch from the invoking directory
+		currentBranch: invokingBranch,
+		terminals:     make(map[string]*terminal.Terminal),
+		tmuxSocket:    tmuxSocket,
 	}
+}
+
+// SetProgram sets the Bubble Tea program reference, needed for terminal async messages.
+func (m *Model) SetProgram(p *tea.Program) {
+	m.program = p
 }
 
 func (m *Model) Init() tea.Cmd {
 	return tea.Batch(
-		textinput.Blink,
 		m.loadSessions(),
 		m.spinner.Tick,
 	)
 }
+
+// detachTerminal detaches the terminal for the given session name (stops polling)
+// and removes it from the terminals map. The tmux session keeps running.
+func (m *Model) detachTerminal(name string) {
+	if t, ok := m.terminals[name]; ok {
+		t.Detach()
+		delete(m.terminals, name)
+	}
+}
+
+// --- Data loading commands ---
 
 func (m *Model) loadSessions() tea.Cmd {
 	return func() tea.Msg {
@@ -146,7 +198,6 @@ func (m *Model) loadBranches() tea.Cmd {
 			return errMsg{err}
 		}
 
-		// Check which branches already have sessions
 		branchesWithSessions := make(map[string]bool)
 		for _, branch := range branches {
 			sess, _ := m.service.GetSessionByBranch(branch)
@@ -162,20 +213,63 @@ func (m *Model) loadBranches() tea.Cmd {
 	}
 }
 
+// --- Update ---
+
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		m.windowHeight = msg.Height
 		m.windowWidth = msg.Width
+		m.windowHeight = msg.Height
+		// Resize active terminal
+		if m.activeSession != nil {
+			if t, ok := m.terminals[m.activeSession.Name]; ok {
+				tw, th := m.terminalPaneDimensions()
+				t.Resize(tw, th)
+			}
+		}
 		return m, nil
 
 	case tea.KeyMsg:
 		return m.handleKeyMsg(msg)
 
+	case tea.MouseMsg:
+		return m.handleMouseMsg(msg)
+
 	case sessionsLoadedMsg:
 		m.sessions = msg.sessions
-		m.filterSessions()
-		return m, nil
+		active := m.activeSessions()
+		// If we need to select a specific session (e.g. just created), move cursor to it
+		if m.selectAfterLoad != "" {
+			for i, s := range active {
+				if s.Name == m.selectAfterLoad {
+					m.cursor = i
+					break
+				}
+			}
+			m.selectAfterLoad = ""
+		}
+		// Clamp cursor to valid range
+		maxIdx := len(active) - 1
+		if m.archivedCount() > 0 {
+			maxIdx++
+		}
+		if maxIdx < 0 {
+			maxIdx = 0
+		}
+		if m.cursor > maxIdx {
+			m.cursor = maxIdx
+		}
+		cmd := m.switchViewToCurrentSession()
+		// Refresh archived overlay if open
+		if m.overlay == overlayArchivedSessions {
+			m.archivedList = m.archivedSessionsList()
+			if len(m.archivedList) == 0 {
+				m.overlay = overlayNone
+			} else if m.archivedCursor >= len(m.archivedList) {
+				m.archivedCursor = len(m.archivedList) - 1
+			}
+		}
+		return m, cmd
 
 	case branchesLoadedMsg:
 		m.branches = msg.branches
@@ -184,257 +278,476 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case sessionCreatedMsg:
-		// Enter the newly created session immediately
-		m.commandToExec = worktree.GetClaudeCommand(msg.session.WorktreePath)
-		return m, tea.Quit
+		m.overlay = overlayNone
+		m.pendingSessionName = ""
+		m.selectAfterLoad = msg.session.Name
+		m.activatingSession = msg.session.Name
+		return m, tea.Batch(m.loadSessions(), m.activateSession(msg.session, true))
 
 	case sessionDeletedMsg:
-		m.state = stateMain
-		m.message = fmt.Sprintf("✓ Session '%s' deleted", msg.name)
+		m.message = fmt.Sprintf("Session '%s' deleted", msg.name)
 		m.selectedSession = nil
+		if m.activeSession != nil && m.activeSession.Name == msg.name {
+			m.activeSession = nil
+		}
+		if m.deleteFromArchived {
+			m.overlay = overlayArchivedSessions
+			m.deleteFromArchived = false
+		} else {
+			m.overlay = overlayNone
+		}
 		return m, m.loadSessions()
 
 	case sessionArchivedMsg:
-		m.message = fmt.Sprintf("✓ Session '%s' archived", msg.name)
+		m.message = fmt.Sprintf("Session '%s' archived", msg.name)
+		m.detachTerminal(msg.name)
+		if m.activeSession != nil && m.activeSession.Name == msg.name {
+			m.activeSession = nil
+		}
 		return m, m.loadSessions()
 
 	case sessionUnarchivedMsg:
-		m.message = fmt.Sprintf("✓ Session '%s' unarchived", msg.name)
+		m.message = fmt.Sprintf("Session '%s' unarchived", msg.name)
 		return m, m.loadSessions()
 
 	case errMsg:
 		m.err = msg.err
-		m.state = stateMain
+		if m.overlay == overlayCreating {
+			m.overlay = overlayNone
+		}
 		return m, nil
 
 	case spinner.TickMsg:
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
 		return m, cmd
+
+	case terminal.TerminalOutputMsg:
+		// Terminal output arrived, just re-render
+		return m, nil
+
+	case terminal.TerminalExitedMsg:
+		// Terminal process exited - no action needed, View() will show last state
+		return m, nil
 	}
 
-	var cmd tea.Cmd
-	m.textInput, cmd = m.textInput.Update(msg)
-	m.filterSessions()
-
-	return m, cmd
+	return m, nil
 }
 
+func (m *Model) activateSession(sess *session.Session, switchFocus bool) tea.Cmd {
+	return func() tea.Msg {
+		m.activeSession = sess
+		if switchFocus {
+			m.focus = focusTerminal
+		}
+
+		tw, th := m.terminalPaneDimensions()
+
+		if err := m.ensureTerminal(sess, tw, th); err != nil {
+			return errMsg{err}
+		}
+
+		m.service.TouchSession(sess.Name)
+		m.activatingSession = ""
+		return nil
+	}
+}
+
+// ensureTerminal guarantees a running terminal wrapper exists for the session.
+// It reuses an existing wrapper, reattaches to a persisted tmux session,
+// or creates a new tmux session as needed.
+func (m *Model) ensureTerminal(sess *session.Session, width, height int) error {
+	// If we have a running terminal wrapper, just resize
+	if t, ok := m.terminals[sess.Name]; ok && t.IsRunning() {
+		t.Resize(width, height)
+		return nil
+	}
+
+	// If wrapper exists but stopped, detach it before reattaching
+	m.detachTerminal(sess.Name)
+
+	// If tmux session already exists on the socket, reattach
+	if terminal.SessionExists(m.tmuxSocket, sess.Name) {
+		t, err := terminal.Attach(sess.Name, width, height, m.program, m.tmuxSocket)
+		if err != nil {
+			return err
+		}
+		m.terminals[sess.Name] = t
+		// If the pane process died while ATC was away, respawn with --continue
+		if !t.IsRunning() {
+			if err := t.Respawn(true); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	// No tmux session exists, create a new one
+	continueSession := worktree.HasExistingConversation(sess.WorktreePath)
+	t, err := terminal.New(sess.Name, sess.WorktreePath, width, height, continueSession, m.program, m.tmuxSocket)
+	if err != nil {
+		return err
+	}
+	m.terminals[sess.Name] = t
+	return nil
+}
+
+// --- Key handling ---
+
 func (m *Model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch m.state {
-	case stateMain:
-		return m.handleMainKeys(msg)
-	case stateConfirmDelete:
-		return m.handleDeleteConfirmKeys(msg)
-	case stateCreating:
-		// No input during creation
+	// Clear text selection on any key press
+	m.hasSelection = false
+	m.selecting = false
+
+	// Handle overlays first
+	if m.overlay != overlayNone {
+		return m.handleOverlayKeys(msg)
+	}
+
+	// Ctrl+C from terminal switches back to sidebar
+	if msg.String() == "ctrl+c" && m.focus == focusTerminal {
+		m.focus = focusSidebar
 		return m, nil
-	case stateSelectBaseBranch:
-		return m.handleSelectBaseBranchKeys(msg)
-	case stateSelectExistingBranch:
-		return m.handleSelectExistingBranchKeys(msg)
-	case stateConfirmBranchWithSession:
-		return m.handleConfirmBranchWithSessionKeys(msg)
-	case stateEnterNewSessionName:
-		return m.handleEnterNewSessionNameKeys(msg)
+	}
+
+	if m.focus == focusTerminal {
+		return m.handleTerminalKeys(msg)
+	}
+	return m.handleSidebarKeys(msg)
+}
+
+func (m *Model) handleMouseMsg(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	if m.overlay != overlayNone {
+		return m, nil
+	}
+
+	termStartX := sidebarWidth + 1 // sidebar visual width (includes border) + spacer
+
+	switch {
+	case msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionPress:
+		// Start selection if click is in terminal pane area
+		if msg.X >= termStartX && m.activeSession != nil {
+			col := msg.X - termStartX
+			tw, _ := m.terminalPaneDimensions()
+			if col >= tw {
+				col = tw - 1
+			}
+			row := msg.Y + 1 // empirical offset: Bubble Tea mouse Y is 1 above rendered row
+			m.selecting = true
+			m.selStartCol = col
+			m.selStartRow = row
+			m.selEndCol = col
+			m.selEndRow = row
+			m.hasSelection = false
+			// Click on terminal switches focus
+			if m.focus == focusSidebar {
+				m.focus = focusTerminal
+			}
+		} else {
+			m.hasSelection = false
+			m.selecting = false
+		}
+		return m, nil
+
+	case msg.Action == tea.MouseActionMotion:
+		if m.selecting {
+			col := msg.X - termStartX
+			if col < 0 {
+				col = 0
+			}
+			tw, th := m.terminalPaneDimensions()
+			if col >= tw {
+				col = tw - 1
+			}
+			row := msg.Y + 1
+			if row < 0 {
+				row = 0
+			}
+			if row >= th {
+				row = th - 1
+			}
+			m.selEndCol = col
+			m.selEndRow = row
+			m.hasSelection = true
+		}
+		return m, nil
+
+	case msg.Action == tea.MouseActionRelease:
+		if m.selecting {
+			m.selecting = false
+			col := msg.X - termStartX
+			if col < 0 {
+				col = 0
+			}
+			tw, th := m.terminalPaneDimensions()
+			if col >= tw {
+				col = tw - 1
+			}
+			row := msg.Y + 1
+			if row < 0 {
+				row = 0
+			}
+			if row >= th {
+				row = th - 1
+			}
+			m.selEndCol = col
+			m.selEndRow = row
+			// Only finalize selection if the mouse actually moved
+			if m.selStartRow != m.selEndRow || m.selStartCol != m.selEndCol {
+				m.hasSelection = true
+				m.copySelectionToClipboard()
+			} else {
+				m.hasSelection = false
+			}
+		}
+		return m, nil
+
+	case msg.Button == tea.MouseButtonWheelUp:
+		if m.focus != focusTerminal || m.activeSession == nil {
+			return m, nil
+		}
+		t, ok := m.terminals[m.activeSession.Name]
+		if !ok || !t.IsRunning() {
+			return m, nil
+		}
+		m.hasSelection = false
+		t.ScrollUp(3)
+		return m, nil
+
+	case msg.Button == tea.MouseButtonWheelDown:
+		if m.focus != focusTerminal || m.activeSession == nil {
+			return m, nil
+		}
+		t, ok := m.terminals[m.activeSession.Name]
+		if !ok || !t.IsRunning() {
+			return m, nil
+		}
+		m.hasSelection = false
+		t.ScrollDown(3)
+		return m, nil
 	}
 	return m, nil
 }
 
-func (m *Model) handleMainKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *Model) handleSidebarKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
-	case "ctrl+c", "esc":
+	case "q", "ctrl+c":
+		// Detach all terminals (stop polling) but leave tmux sessions running
+		for _, t := range m.terminals {
+			t.Detach()
+		}
 		return m, tea.Quit
 
-	case "up":
+	case "up", "k":
 		if m.cursor > 0 {
 			m.cursor--
 			m.adjustScroll()
+			return m, m.switchViewToCurrentSession()
 		}
 		return m, nil
 
-	case "down":
-		maxCursor := len(m.filteredSessions) // +1 for "Create new" option
-		if m.cursor < maxCursor {
+	case "down", "j":
+		active := m.activeSessions()
+		maxIdx := len(active) - 1
+		if m.archivedCount() > 0 {
+			maxIdx++
+		}
+		if m.cursor < maxIdx {
 			m.cursor++
 			m.adjustScroll()
+			return m, m.switchViewToCurrentSession()
 		}
 		return m, nil
 
 	case "enter":
 		return m.handleEnter()
 
-	case "ctrl+d":
-		return m.handleDelete()
+	case "n":
+		return m.openCreateOverlay()
 
-	case "ctrl+a":
-		return m.handleArchiveToggle()
+	case "d":
+		return m.openDeleteOverlay()
 
-	case "ctrl+b":
-		return m.handleCreateFromExistingBranch()
+	case "a":
+		return m.handleArchive()
+
+	case "?":
+		m.overlay = overlayHelp
+		return m, nil
+
+	case "esc":
+		if m.activeSession != nil {
+			m.focus = focusTerminal
+			return m, nil
+		}
+		return m, nil
 
 	default:
-		// Pass key to text input for typing
-		m.message = ""
-		m.err = nil
-		var cmd tea.Cmd
-		m.textInput, cmd = m.textInput.Update(msg)
-		m.filterSessions()
-		return m, cmd
+		return m, nil
 	}
 }
 
-func (m *Model) handleEnter() (tea.Model, tea.Cmd) {
-	// First option is always "Create new"
-	if m.cursor == 0 {
-		return m.createSession()
-	}
-
-	// Enter existing session
-	selected := m.getSelectedSession()
-	if selected == nil {
+func (m *Model) handleTerminalKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.activeSession == nil {
 		return m, nil
 	}
 
-	cmd, err := m.service.EnterSession(selected.Name)
-	if err != nil {
-		m.err = err
+	t, ok := m.terminals[m.activeSession.Name]
+	if !ok {
 		return m, nil
 	}
 
-	m.commandToExec = cmd
-	return m, tea.Quit
-}
-
-func (m *Model) createSession() (tea.Model, tea.Cmd) {
-	name := strings.TrimSpace(m.textInput.Value())
-	if name == "" {
-		m.err = fmt.Errorf("session name cannot be empty")
-		return m, nil
-	}
-
-	// Validate name before showing branch selection
-	if err := worktree.ValidateBranchName(name); err != nil {
-		m.err = fmt.Errorf("invalid session name: %w", err)
-		return m, nil
-	}
-
-	// Store the pending session name and transition to branch selection
-	m.pendingSessionName = name
-	m.state = stateSelectBaseBranch
-	m.initBranchInput()
-
-	return m, m.loadBranches()
-}
-
-// initBranchInput creates and initializes the branch filter input
-func (m *Model) initBranchInput() {
-	m.branchInput = textinput.New()
-	m.branchInput.Placeholder = "Type to filter branches..."
-	m.branchInput.Focus()
-	m.branchInput.CharLimit = 100
-	m.branchInput.Width = 50
-	m.branchCursor = 0
-	m.branchScrollOffset = 0
-}
-
-func (m *Model) doCreateSession(baseBranch string, useExisting bool) tea.Cmd {
-	name := m.pendingSessionName
-	m.state = stateCreating
-	m.createOutput = ""
-
-	return func() tea.Msg {
-		var buf bytes.Buffer
-		session, err := m.service.CreateSession(name, baseBranch, useExisting, &buf)
-		if err != nil {
-			return errMsg{err}
+	// Check if session ended - Enter restarts
+	if !t.IsRunning() {
+		if msg.Type == tea.KeyEnter {
+			if err := t.Respawn(true); err != nil {
+				m.err = err
+				return m, nil
+			}
+			return m, nil
 		}
-		return sessionCreatedMsg{
-			session: session,
-			output:  buf.String(),
-		}
-	}
-}
-
-// getSelectedSession returns the currently selected session, or nil if cursor
-// is on "Create new" option or out of bounds
-func (m *Model) getSelectedSession() *session.Session {
-	if m.cursor == 0 {
-		return nil
-	}
-	sessionIdx := m.cursor - 1
-	if sessionIdx >= 0 && sessionIdx < len(m.filteredSessions) {
-		return m.filteredSessions[sessionIdx]
-	}
-	return nil
-}
-
-func (m *Model) handleDelete() (tea.Model, tea.Cmd) {
-	selected := m.getSelectedSession()
-	if selected == nil {
 		return m, nil
 	}
-	m.selectedSession = selected
-	m.state = stateConfirmDelete
+
+	// Page Up/Down for scrolling
+	if msg.Type == tea.KeyPgUp {
+		_, th := m.terminalPaneDimensions()
+		t.ScrollUp(th / 2)
+		return m, nil
+	}
+	if msg.Type == tea.KeyPgDown {
+		_, th := m.terminalPaneDimensions()
+		t.ScrollDown(th / 2)
+		return m, nil
+	}
+
+	// Any other key exits scroll mode (don't forward to tmux —
+	// prevents partially-parsed mouse escape sequences from leaking through)
+	if t.IsScrollMode() {
+		t.ExitScrollMode()
+		return m, nil
+	}
+
+	// Send key to tmux session
+	t.SendKeys(msg)
 	return m, nil
 }
 
-func (m *Model) handleArchiveToggle() (tea.Model, tea.Cmd) {
-	selected := m.getSelectedSession()
-	if selected == nil {
+func (m *Model) handleEnter() (tea.Model, tea.Cmd) {
+	active := m.activeSessions()
+	// Cursor on the archived line?
+	if m.archivedCount() > 0 && m.cursor == len(active) {
+		return m.openArchivedOverlay()
+	}
+	if m.cursor >= len(active) {
 		return m, nil
 	}
+	return m, m.activateSession(active[m.cursor], true)
+}
 
-	if selected.Status == "archived" {
-		return m, func() tea.Msg {
-			err := m.service.UnarchiveSession(selected.Name)
-			if err != nil {
-				return errMsg{err}
-			}
-			return sessionUnarchivedMsg{selected.Name}
-		}
+func (m *Model) openCreateOverlay() (tea.Model, tea.Cmd) {
+	m.createInput = textinput.New()
+	m.createInput.Placeholder = "Session name..."
+	m.createInput.Focus()
+	m.createInput.CharLimit = 100
+	m.createInput.Width = 40
+	m.overlay = overlayCreateSession
+	m.err = nil
+	return m, textinput.Blink
+}
+
+func (m *Model) openDeleteOverlay() (tea.Model, tea.Cmd) {
+	active := m.activeSessions()
+	if len(active) == 0 || m.cursor >= len(active) {
+		return m, nil
 	}
+	m.selectedSession = active[m.cursor]
+	m.overlay = overlayDeleteConfirm
+	return m, nil
+}
+
+func (m *Model) handleArchive() (tea.Model, tea.Cmd) {
+	active := m.activeSessions()
+	if len(active) == 0 || m.cursor >= len(active) {
+		return m, nil
+	}
+	selected := active[m.cursor]
 	return m, func() tea.Msg {
-		err := m.service.ArchiveSession(selected.Name)
-		if err != nil {
+		if err := m.service.ArchiveSession(selected.Name); err != nil {
 			return errMsg{err}
 		}
 		return sessionArchivedMsg{selected.Name}
 	}
 }
 
-func (m *Model) handleDeleteConfirmKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "y", "Y":
-		name := m.selectedSession.Name
-		return m, func() tea.Msg {
-			err := m.service.DeleteSession(name)
-			if err != nil {
-				return errMsg{err}
-			}
-			return sessionDeletedMsg{name}
-		}
+// --- Overlay key handlers ---
 
-	case "n", "N", "esc":
-		m.state = stateMain
-		m.selectedSession = nil
+func (m *Model) handleOverlayKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch m.overlay {
+	case overlayCreateSession:
+		return m.handleCreateOverlayKeys(msg)
+	case overlaySelectBaseBranch:
+		return m.handleSelectBaseBranchKeys(msg)
+	case overlaySelectExistingBranch:
+		return m.handleSelectExistingBranchKeys(msg)
+	case overlayConfirmBranchWithSession:
+		return m.handleConfirmBranchWithSessionKeys(msg)
+	case overlayEnterNewSessionName:
+		return m.handleEnterNewSessionNameKeys(msg)
+	case overlayDeleteConfirm:
+		return m.handleDeleteConfirmKeys(msg)
+	case overlayHelp:
+		return m.handleHelpKeys(msg)
+	case overlayCreating:
 		return m, nil
+	case overlayArchivedSessions:
+		return m.handleArchivedOverlayKeys(msg)
 	}
-
 	return m, nil
 }
 
-func (m *Model) handleCreateFromExistingBranch() (tea.Model, tea.Cmd) {
-	m.state = stateSelectExistingBranch
-	m.initBranchInput()
-
-	return m, m.loadBranches()
+func (m *Model) handleCreateOverlayKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.overlay = overlayNone
+		m.err = nil
+		return m, nil
+	case "ctrl+c":
+		return m, tea.Quit
+	case "ctrl+b":
+		m.overlay = overlaySelectExistingBranch
+		m.initBranchInput()
+		return m, m.loadBranches()
+	case "enter":
+		name := strings.TrimSpace(m.createInput.Value())
+		if name == "" {
+			m.err = fmt.Errorf("session name cannot be empty")
+			return m, nil
+		}
+		if err := worktree.ValidateBranchName(name); err != nil {
+			m.err = fmt.Errorf("invalid session name: %w", err)
+			return m, nil
+		}
+		m.pendingSessionName = name
+		m.overlay = overlaySelectBaseBranch
+		m.initBranchInput()
+		return m, m.loadBranches()
+	default:
+		var cmd tea.Cmd
+		m.createInput, cmd = m.createInput.Update(msg)
+		m.err = nil
+		return m, cmd
+	}
 }
 
-// showHeadOption returns true if the HEAD option should be visible in the branch list
-func (m *Model) showHeadOption() bool {
-	filter := strings.ToLower(m.branchInput.Value())
-	return filter == "" || strings.Contains("head", filter)
+func (m *Model) initBranchInput() {
+	m.branchInput = textinput.New()
+	m.branchInput.Placeholder = "Filter branches..."
+	m.branchInput.Focus()
+	m.branchInput.CharLimit = 100
+	m.branchInput.Width = 40
+	m.branchCursor = 0
+	m.branchScrollOffset = 0
 }
 
 func (m *Model) handleSelectBaseBranchKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -445,22 +758,22 @@ func (m *Model) handleSelectBaseBranchKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) 
 	}
 
 	switch msg.String() {
-	case "ctrl+c", "esc":
-		m.state = stateMain
-		m.pendingSessionName = ""
-		return m, nil
+	case "ctrl+c":
+		return m, tea.Quit
+	case "esc":
+		m.overlay = overlayCreateSession
+		m.createInput.Focus()
+		return m, textinput.Blink
 
 	case "up":
 		if m.branchCursor > 0 {
 			m.branchCursor--
-			m.adjustBranchScroll(totalItems)
 		}
 		return m, nil
 
 	case "down":
 		if m.branchCursor < totalItems-1 {
 			m.branchCursor++
-			m.adjustBranchScroll(totalItems)
 		}
 		return m, nil
 
@@ -478,12 +791,201 @@ func (m *Model) handleSelectBaseBranchKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) 
 		var cmd tea.Cmd
 		m.branchInput, cmd = m.branchInput.Update(msg)
 		m.filterBranches()
-		m.clampBranchCursor()
+		m.clampBranchCursor(totalItems)
 		return m, cmd
 	}
 }
 
-// getSelectedBaseBranch returns the branch name for the current cursor position
+func (m *Model) handleSelectExistingBranchKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	totalItems := len(m.filteredBranches)
+
+	switch msg.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+	case "esc":
+		m.overlay = overlayCreateSession
+		m.createInput.Focus()
+		return m, textinput.Blink
+
+	case "up":
+		if m.branchCursor > 0 {
+			m.branchCursor--
+		}
+		return m, nil
+
+	case "down":
+		if m.branchCursor < totalItems-1 {
+			m.branchCursor++
+		}
+		return m, nil
+
+	case "enter":
+		if totalItems == 0 || m.branchCursor >= totalItems {
+			return m, nil
+		}
+		selectedBranch := m.filteredBranches[m.branchCursor]
+		if m.branchesWithSessions[selectedBranch] {
+			m.selectedBranchName = selectedBranch
+			m.overlay = overlayConfirmBranchWithSession
+			return m, nil
+		}
+		m.pendingSessionName = selectedBranch
+		return m, m.doCreateSession(selectedBranch, true)
+
+	default:
+		var cmd tea.Cmd
+		m.branchInput, cmd = m.branchInput.Update(msg)
+		m.filterBranches()
+		if m.branchCursor >= len(m.filteredBranches) {
+			m.branchCursor = len(m.filteredBranches) - 1
+			if m.branchCursor < 0 {
+				m.branchCursor = 0
+			}
+		}
+		return m, cmd
+	}
+}
+
+func (m *Model) handleConfirmBranchWithSessionKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "y", "Y":
+		m.newSessionInput = textinput.New()
+		m.newSessionInput.Placeholder = "New session name..."
+		m.newSessionInput.Focus()
+		m.newSessionInput.CharLimit = 100
+		m.newSessionInput.Width = 40
+		m.overlay = overlayEnterNewSessionName
+		return m, textinput.Blink
+	case "n", "N", "esc":
+		m.overlay = overlaySelectExistingBranch
+		m.selectedBranchName = ""
+		return m, nil
+	case "ctrl+c":
+		return m, tea.Quit
+	}
+	return m, nil
+}
+
+func (m *Model) handleEnterNewSessionNameKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+	case "esc":
+		m.overlay = overlaySelectExistingBranch
+		m.selectedBranchName = ""
+		return m, nil
+	case "enter":
+		name := strings.TrimSpace(m.newSessionInput.Value())
+		if name == "" {
+			m.err = fmt.Errorf("session name cannot be empty")
+			return m, nil
+		}
+		if err := worktree.ValidateBranchName(name); err != nil {
+			m.err = fmt.Errorf("invalid session name: %w", err)
+			return m, nil
+		}
+		m.pendingSessionName = name
+		return m, m.doCreateSession(m.selectedBranchName, false)
+	default:
+		var cmd tea.Cmd
+		m.newSessionInput, cmd = m.newSessionInput.Update(msg)
+		m.err = nil
+		return m, cmd
+	}
+}
+
+func (m *Model) handleDeleteConfirmKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "y", "Y":
+		name := m.selectedSession.Name
+		// Close terminal if running
+		if t, ok := m.terminals[name]; ok {
+			t.Close()
+			delete(m.terminals, name)
+		}
+		return m, func() tea.Msg {
+			if err := m.service.DeleteSession(name); err != nil {
+				return errMsg{err}
+			}
+			return sessionDeletedMsg{name}
+		}
+	case "n", "N", "esc":
+		if m.deleteFromArchived {
+			m.overlay = overlayArchivedSessions
+			m.deleteFromArchived = false
+		} else {
+			m.overlay = overlayNone
+		}
+		m.selectedSession = nil
+		return m, nil
+	case "ctrl+c":
+		return m, tea.Quit
+	}
+	return m, nil
+}
+
+func (m *Model) handleHelpKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "?", "q":
+		m.overlay = overlayNone
+		return m, nil
+	case "ctrl+c":
+		return m, tea.Quit
+	}
+	return m, nil
+}
+
+func (m *Model) doCreateSession(baseBranch string, useExisting bool) tea.Cmd {
+	name := m.pendingSessionName
+	m.overlay = overlayCreating
+
+	return func() tea.Msg {
+		var buf bytes.Buffer
+		sess, err := m.service.CreateSession(name, baseBranch, useExisting, &buf)
+		if err != nil {
+			return errMsg{err}
+		}
+		return sessionCreatedMsg{session: sess}
+	}
+}
+
+// --- Helper methods ---
+
+func (m *Model) activeSessions() []*session.Session {
+	var active []*session.Session
+	for _, s := range m.sessions {
+		if s.Status != "archived" {
+			active = append(active, s)
+		}
+	}
+	return active
+}
+
+func (m *Model) archivedCount() int {
+	count := 0
+	for _, s := range m.sessions {
+		if s.Status == "archived" {
+			count++
+		}
+	}
+	return count
+}
+
+func (m *Model) archivedSessionsList() []*session.Session {
+	var archived []*session.Session
+	for _, s := range m.sessions {
+		if s.Status == "archived" {
+			archived = append(archived, s)
+		}
+	}
+	return archived
+}
+
+func (m *Model) showHeadOption() bool {
+	filter := strings.ToLower(m.branchInput.Value())
+	return filter == "" || strings.Contains("head", filter)
+}
+
 func (m *Model) getSelectedBaseBranch(showHead bool) string {
 	if showHead && m.branchCursor == 0 {
 		return "HEAD"
@@ -498,12 +1000,7 @@ func (m *Model) getSelectedBaseBranch(showHead bool) string {
 	return ""
 }
 
-// clampBranchCursor ensures the branch cursor stays within valid bounds
-func (m *Model) clampBranchCursor() {
-	total := len(m.filteredBranches)
-	if m.showHeadOption() {
-		total++
-	}
+func (m *Model) clampBranchCursor(total int) {
 	if m.branchCursor >= total {
 		m.branchCursor = total - 1
 	}
@@ -512,79 +1009,604 @@ func (m *Model) clampBranchCursor() {
 	}
 }
 
-func (m *Model) handleSelectExistingBranchKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	totalItems := len(m.filteredBranches)
+func (m *Model) filterBranches() {
+	query := strings.ToLower(strings.TrimSpace(m.branchInput.Value()))
 
-	switch msg.String() {
-	case "ctrl+c", "esc":
-		m.state = stateMain
-		return m, nil
-
-	case "up":
-		if m.branchCursor > 0 {
-			m.branchCursor--
-			m.adjustBranchScroll(totalItems)
+	if query == "" {
+		m.filteredBranches = m.branches
+	} else {
+		m.filteredBranches = nil
+		for _, branch := range m.branches {
+			if strings.Contains(strings.ToLower(branch), query) {
+				m.filteredBranches = append(m.filteredBranches, branch)
+			}
 		}
-		return m, nil
-
-	case "down":
-		if m.branchCursor < totalItems-1 {
-			m.branchCursor++
-			m.adjustBranchScroll(totalItems)
-		}
-		return m, nil
-
-	case "enter":
-		if totalItems == 0 || m.branchCursor >= totalItems {
-			return m, nil
-		}
-		selectedBranch := m.filteredBranches[m.branchCursor]
-
-		if m.branchesWithSessions[selectedBranch] {
-			m.selectedBranchName = selectedBranch
-			m.state = stateConfirmBranchWithSession
-			return m, nil
-		}
-
-		m.pendingSessionName = selectedBranch
-		return m, m.doCreateSession(selectedBranch, true)
-
-	default:
-		var cmd tea.Cmd
-		m.branchInput, cmd = m.branchInput.Update(msg)
-		m.filterBranches()
-		m.clampExistingBranchCursor()
-		return m, cmd
 	}
 }
 
-// clampExistingBranchCursor ensures the cursor stays within filtered branch bounds
-func (m *Model) clampExistingBranchCursor() {
-	if m.branchCursor >= len(m.filteredBranches) {
-		m.branchCursor = len(m.filteredBranches) - 1
+func (m *Model) adjustScroll() {
+	maxVisible := m.maxVisibleSessions()
+	if maxVisible <= 0 {
+		maxVisible = 1
 	}
-	if m.branchCursor < 0 {
-		m.branchCursor = 0
+	if m.cursor < m.scrollOffset {
+		m.scrollOffset = m.cursor
+	}
+	if m.cursor >= m.scrollOffset+maxVisible {
+		m.scrollOffset = m.cursor - maxVisible + 1
+	}
+	if m.scrollOffset < 0 {
+		m.scrollOffset = 0
 	}
 }
 
-func (m *Model) handleConfirmBranchWithSessionKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *Model) maxVisibleSessions() int {
+	// tower+blank+topborder(8) + [archived line(1)] + bottom border(1) = 10
+	available := m.windowHeight - 10
+	if available < 1 {
+		return 1
+	}
+	return available // 1 line per session now
+}
+
+// terminalPaneDimensions returns the inner width/height for the terminal pane.
+func (m *Model) terminalPaneDimensions() (int, int) {
+	// sidebarWidth already includes border chars, plus 1 for spacer
+	termWidth := m.windowWidth - sidebarWidth - 1
+	if termWidth < 10 {
+		termWidth = 10
+	}
+	termHeight := m.windowHeight // no terminal border
+	if termHeight < 5 {
+		termHeight = 5
+	}
+	return termWidth, termHeight
+}
+
+// --- View ---
+
+func (m *Model) View() string {
+	if m.windowWidth == 0 || m.windowHeight == 0 {
+		return "Loading..."
+	}
+
+	sidebar := m.viewSidebar()
+	termPane := m.viewTerminal()
+
+	layout := lipgloss.JoinHorizontal(lipgloss.Top, sidebar, " ", termPane)
+
+	// Render overlay on top if active
+	if m.overlay != overlayNone {
+		overlayContent := m.viewOverlay()
+		if overlayContent != "" {
+			return m.renderOverlayOnTop(layout, overlayContent)
+		}
+	}
+
+	return layout
+}
+
+func (m *Model) viewSidebar() string {
+	innerWidth := sidebarWidth - 2
+	if innerWidth < 1 {
+		innerWidth = 1
+	}
+
+	// Focus-mapped styles: primary→textMuted, textNormal→textMuted, textMuted→textDim
+	var towerStyle, atcStyle, versionStyle, repoStyle, helpKeyStyle, helpDescStyle lipgloss.Style
+	if m.focus == focusSidebar {
+		towerStyle = lipgloss.NewStyle().Foreground(primary)
+		atcStyle = lipgloss.NewStyle().Foreground(textNormal).Bold(true)
+		versionStyle = lipgloss.NewStyle().Foreground(textMuted)
+		repoStyle = lipgloss.NewStyle().Foreground(primary)
+		helpKeyStyle = lipgloss.NewStyle().Foreground(textNormal)
+		helpDescStyle = lipgloss.NewStyle().Foreground(textMuted)
+	} else {
+		towerStyle = lipgloss.NewStyle().Foreground(textMuted)
+		atcStyle = lipgloss.NewStyle().Foreground(textMuted)
+		versionStyle = lipgloss.NewStyle().Foreground(textDim)
+		repoStyle = lipgloss.NewStyle().Foreground(textMuted)
+		helpKeyStyle = lipgloss.NewStyle().Foreground(textMuted)
+		helpDescStyle = lipgloss.NewStyle().Foreground(textDim)
+	}
+
+	helpItem := func(key, desc string) string {
+		return helpDescStyle.Render("[") + helpKeyStyle.Render(key) + helpDescStyle.Render("]") + " " + helpDescStyle.Render(desc)
+	}
+
+	// Tower with keyboard shortcuts (rendered outside the border)
+	var tower strings.Builder
+	pad := "    "
+	tower.WriteString("\n")
+	tower.WriteString("  " + towerStyle.Render("__\\-----/__") + pad + helpItem("^C", "back to sidebar") + "\n")
+	tower.WriteString("  " + towerStyle.Render("\\         /") + pad + helpItem("n", " new session") + "\n")
+	tower.WriteString("  " + towerStyle.Render(" \\  ") + atcStyle.Render("ATC") + towerStyle.Render("  /") + pad + " " + helpItem("a", " archive") + "\n")
+	tower.WriteString("  " + towerStyle.Render("  \\  _  /") + pad + "  " + helpItem("?", " help") + "\n")
+	tower.WriteString("  " + towerStyle.Render("   |   |") + pad + "   " + versionStyle.Render("v"+Version) + "\n")
+	tower.WriteString("\n")
+
+	// Top border with embedded repo name
+	var borderColor lipgloss.Color
+	if m.focus == focusSidebar {
+		borderColor = primary
+	} else {
+		borderColor = textDim
+	}
+	borderStyle := lipgloss.NewStyle().Foreground(borderColor)
+	repoName := truncate(m.repoName, innerWidth-2)
+	fillLen := innerWidth - 2 - len(repoName) // innerWidth minus spaces and name
+	if fillLen < 0 {
+		fillLen = 0
+	}
+	tower.WriteString(borderStyle.Render("┌") + " " + repoStyle.Render(repoName) + " " + borderStyle.Render(strings.Repeat("─", fillLen)+"┐") + "\n")
+
+	// Sidebar content (inside the border)
+	var b strings.Builder
+
+	// Session list
+	filtered := m.activeSessions()
+	maxVisible := m.maxVisibleSessions()
+
+	if len(filtered) == 0 && m.archivedCount() == 0 {
+		b.WriteString(metadataStyle.Render("No sessions") + "\n")
+	} else {
+		endIdx := m.scrollOffset + maxVisible
+		if endIdx > len(filtered) {
+			endIdx = len(filtered)
+		}
+
+		if m.scrollOffset > 0 {
+			b.WriteString(metadataStyle.Render(fmt.Sprintf("  ↑ %d more", m.scrollOffset)) + "\n")
+		}
+
+		for i := m.scrollOffset; i < endIdx; i++ {
+			s := filtered[i]
+			m.renderSidebarSession(&b, s, i, innerWidth)
+		}
+
+		if endIdx < len(filtered) {
+			b.WriteString(metadataStyle.Render(fmt.Sprintf("  ↓ %d more", len(filtered)-endIdx)) + "\n")
+		}
+	}
+
+	// Archived sessions indicator
+	if archivedN := m.archivedCount(); archivedN > 0 {
+		label := fmt.Sprintf("(%d archived)", archivedN)
+		isOnArchived := m.cursor == len(filtered)
+		if isOnArchived {
+			b.WriteString(lipgloss.NewStyle().
+				Background(textMuted).
+				Foreground(lipgloss.Color("#000000")).
+				Bold(true).
+				Width(innerWidth).
+				Render(" "+label) + "\n")
+		} else if m.focus == focusSidebar {
+			b.WriteString(lipgloss.NewStyle().Foreground(textMuted).Render(" "+label) + "\n")
+		} else {
+			b.WriteString(lipgloss.NewStyle().Foreground(textDim).Render(" "+label) + "\n")
+		}
+	}
+
+	// Fill remaining space
+	towerHeight := 8 // 6 tower lines + 1 blank line + 1 custom top border
+	sidebarHeight := m.windowHeight - towerHeight - 1 // minus tower, minus bottom border only
+	if sidebarHeight < 1 {
+		sidebarHeight = 1
+	}
+
+	// Reserve lines for status bar if needed (divider + message = 2 lines)
+	statusLines := 0
+	if m.err != nil || m.message != "" {
+		statusLines = 2
+	}
+
+	contentLines := strings.Count(b.String(), "\n")
+	targetLines := sidebarHeight - statusLines
+	if targetLines < contentLines {
+		targetLines = contentLines
+	}
+	for contentLines < targetLines {
+		b.WriteString("\n")
+		contentLines++
+	}
+
+	// Status bar (errors/messages only)
+	if m.err != nil {
+		b.WriteString(dividerStyle.Render(strings.Repeat("─", innerWidth)) + "\n")
+		b.WriteString(errorStyle.Render(truncate(m.err.Error(), innerWidth)) + "\n")
+	} else if m.message != "" {
+		b.WriteString(dividerStyle.Render(strings.Repeat("─", innerWidth)) + "\n")
+		b.WriteString(successStyle.Render(truncate(m.message, innerWidth)) + "\n")
+	}
+
+	style := sidebarUnfocusedStyle.BorderTop(false)
+	if m.focus == focusSidebar {
+		style = sidebarFocusedStyle.BorderTop(false)
+	}
+
+	bordered := style.
+		Width(sidebarWidth - 2).
+		Height(sidebarHeight).
+		Render(b.String())
+
+	return tower.String() + bordered
+}
+
+func (m *Model) renderSidebarSession(b *strings.Builder, s *session.Session, idx int, maxWidth int) {
+	isSelected := m.cursor == idx
+	name := truncate(s.Name, maxWidth-2)
+
+	var style lipgloss.Style
+	if m.focus == focusSidebar {
+		if isSelected {
+			style = sidebarSessionSelectedStyle.Width(maxWidth)
+		} else {
+			style = sidebarSessionStyle
+		}
+	} else {
+		if isSelected {
+			style = sidebarSessionDimSelectedStyle.Width(maxWidth)
+		} else {
+			style = sidebarSessionDimStyle
+		}
+	}
+	b.WriteString(style.Render(" "+name) + "\n")
+}
+
+func (m *Model) viewTerminal() string {
+	tw, th := m.terminalPaneDimensions()
+
+	// tmux capture-pane output is already at the correct dimensions.
+
+	if m.activeSession != nil {
+		if t, ok := m.terminals[m.activeSession.Name]; ok {
+			var rendered string
+			if !t.IsRunning() {
+				rendered = t.Render() + "\n\n  Session ended. Press Enter to restart."
+			} else {
+				rendered = t.Render()
+			}
+
+			// Overlay scroll indicator when in scroll mode
+			scrollPos := t.ScrollPosition()
+			if scrollPos > 0 {
+				indicator := scrollIndicatorStyle.Render(fmt.Sprintf(" SCROLL -%d ", scrollPos))
+				lines := strings.Split(rendered, "\n")
+				if len(lines) > 0 {
+					indicatorW := lipgloss.Width(indicator)
+					padLen := tw - indicatorW
+					if padLen < 0 {
+						padLen = 0
+					}
+					lines[0] = strings.Repeat(" ", padLen) + indicator
+				}
+				rendered = strings.Join(lines, "\n")
+			}
+
+			// Apply selection highlight
+			if m.hasSelection || m.selecting {
+				rendered = m.applySelectionHighlight(rendered)
+			}
+
+			// Dim terminal content when sidebar is focused
+			if m.focus == focusSidebar {
+				rendered = lipgloss.NewStyle().Foreground(textDim).Render(stripANSI(rendered))
+			}
+
+			return rendered
+		}
+	}
+
+	// Placeholder content — use lipgloss to fill the pane
+	var content string
+	if m.activeSession == nil {
+		placeholder := placeholderStyle.Render("Select a session or press 'n' to create one")
+		content = "\n\n" + centerText(placeholder, tw)
+	} else {
+		placeholder := placeholderStyle.Render("Press Enter to start session")
+		content = "\n\n" + centerText(placeholder, tw)
+	}
+
+	return lipgloss.NewStyle().
+		Width(tw).
+		Height(th).
+		Render(content)
+}
+
+func (m *Model) viewOverlay() string {
+	switch m.overlay {
+	case overlayCreateSession:
+		return m.viewCreateOverlay()
+	case overlaySelectBaseBranch:
+		return m.viewSelectBaseBranch()
+	case overlaySelectExistingBranch:
+		return m.viewSelectExistingBranch()
+	case overlayConfirmBranchWithSession:
+		return m.viewConfirmBranchWithSession()
+	case overlayEnterNewSessionName:
+		return m.viewEnterNewSessionName()
+	case overlayDeleteConfirm:
+		return m.viewDeleteOverlay()
+	case overlayHelp:
+		return m.viewHelpOverlay()
+	case overlayCreating:
+		return m.viewCreatingOverlay()
+	case overlayArchivedSessions:
+		return m.viewArchivedOverlay()
+	}
+	return ""
+}
+
+func (m *Model) viewCreateOverlay() string {
+	var b strings.Builder
+	b.WriteString(titleStyle.Render("New Session"))
+	b.WriteString("\n\n")
+	b.WriteString(dialogTextStyle.Render("Session name:"))
+	b.WriteString("\n")
+	b.WriteString(m.createInput.View())
+	b.WriteString("\n")
+	if m.err != nil {
+		b.WriteString("\n" + errorStyle.Render(m.err.Error()))
+	}
+	b.WriteString("\n\n")
+	b.WriteString(helpStyle.Render("[Enter] Next  [^B] From branch  [Esc] Cancel"))
+	return dialogBoxStyle.Render(b.String())
+}
+
+func (m *Model) viewSelectBaseBranch() string {
+	var b strings.Builder
+	b.WriteString(titleStyle.Render(fmt.Sprintf("Creating \"%s\"", m.pendingSessionName)))
+	b.WriteString("\n")
+	b.WriteString(subtitleStyle.Render("Select base branch:"))
+	b.WriteString("\n\n")
+	b.WriteString(m.branchInput.View())
+	b.WriteString("\n\n")
+
+	showHead := m.showHeadOption()
+	if showHead {
+		headLabel := fmt.Sprintf("HEAD (%s)", m.currentBranch)
+		if m.branchCursor == 0 {
+			b.WriteString(selectedItemStyle.Render("▸ "+headLabel) + "\n")
+		} else {
+			b.WriteString(normalItemStyle.Render("  "+headLabel) + "\n")
+		}
+	}
+
+	maxVisible := 10
+	startIdx := 0
+	cursorOffset := 0
+	if showHead {
+		cursorOffset = 1
+	}
+	branchIdx := m.branchCursor - cursorOffset
+	if branchIdx >= startIdx+maxVisible {
+		startIdx = branchIdx - maxVisible + 1
+	}
+	if branchIdx < startIdx && branchIdx >= 0 {
+		startIdx = branchIdx
+	}
+	endIdx := startIdx + maxVisible
+	if endIdx > len(m.filteredBranches) {
+		endIdx = len(m.filteredBranches)
+	}
+
+	if startIdx > 0 {
+		b.WriteString(metadataStyle.Render(fmt.Sprintf("  ↑ %d more", startIdx)) + "\n")
+	}
+	for i := startIdx; i < endIdx; i++ {
+		branch := m.filteredBranches[i]
+		pos := i + cursorOffset
+		if m.branchCursor == pos {
+			b.WriteString(selectedItemStyle.Render("▸ "+branch) + "\n")
+		} else {
+			b.WriteString(normalItemStyle.Render("  "+branch) + "\n")
+		}
+	}
+	if endIdx < len(m.filteredBranches) {
+		b.WriteString(metadataStyle.Render(fmt.Sprintf("  ↓ %d more", len(m.filteredBranches)-endIdx)) + "\n")
+	}
+
+	b.WriteString("\n")
+	b.WriteString(helpStyle.Render("[↑/↓] Navigate  [Enter] Select  [Esc] Back"))
+	return dialogBoxStyle.Render(b.String())
+}
+
+func (m *Model) viewSelectExistingBranch() string {
+	var b strings.Builder
+	b.WriteString(titleStyle.Render("From existing branch"))
+	b.WriteString("\n\n")
+	b.WriteString(m.branchInput.View())
+	b.WriteString("\n\n")
+
+	maxVisible := 10
+	startIdx := 0
+	if m.branchCursor >= startIdx+maxVisible {
+		startIdx = m.branchCursor - maxVisible + 1
+	}
+	endIdx := startIdx + maxVisible
+	if endIdx > len(m.filteredBranches) {
+		endIdx = len(m.filteredBranches)
+	}
+
+	if len(m.filteredBranches) == 0 {
+		b.WriteString(metadataStyle.Render("  No branches match filter") + "\n")
+	} else {
+		if startIdx > 0 {
+			b.WriteString(metadataStyle.Render(fmt.Sprintf("  ↑ %d more", startIdx)) + "\n")
+		}
+		for i := startIdx; i < endIdx; i++ {
+			branch := m.filteredBranches[i]
+			hasSession := m.branchesWithSessions[branch]
+			displayName := branch
+			if hasSession {
+				displayName = "● " + branch
+			}
+			if m.branchCursor == i {
+				b.WriteString(selectedItemStyle.Render("▸ "+displayName) + "\n")
+			} else {
+				b.WriteString(normalItemStyle.Render("  "+displayName) + "\n")
+			}
+		}
+		if endIdx < len(m.filteredBranches) {
+			b.WriteString(metadataStyle.Render(fmt.Sprintf("  ↓ %d more", len(m.filteredBranches)-endIdx)) + "\n")
+		}
+	}
+
+	b.WriteString("\n")
+	b.WriteString(helpStyle.Render("[↑/↓] Navigate  [Enter] Select  [Esc] Back  ● has session"))
+	return dialogBoxStyle.Render(b.String())
+}
+
+func (m *Model) viewConfirmBranchWithSession() string {
+	var b strings.Builder
+	b.WriteString(dialogTitleStyle.Render("Branch Has Existing Session"))
+	b.WriteString("\n\n")
+	b.WriteString(dialogTextStyle.Render(fmt.Sprintf("Branch \"%s\" already has a session.", m.selectedBranchName)))
+	b.WriteString("\n\n")
+	b.WriteString(dialogTextStyle.Render("Create a new session branching from it?"))
+	b.WriteString("\n\n")
+	b.WriteString(dialogTextStyle.Render("[Y] Yes    [N] Cancel"))
+	return dialogBoxStyle.Render(b.String())
+}
+
+func (m *Model) viewEnterNewSessionName() string {
+	var b strings.Builder
+	b.WriteString(titleStyle.Render(fmt.Sprintf("New session from \"%s\"", m.selectedBranchName)))
+	b.WriteString("\n\n")
+	b.WriteString(dialogTextStyle.Render("Session name:"))
+	b.WriteString("\n")
+	b.WriteString(m.newSessionInput.View())
+	if m.err != nil {
+		b.WriteString("\n\n" + errorStyle.Render(m.err.Error()))
+	}
+	b.WriteString("\n\n")
+	b.WriteString(helpStyle.Render("[Enter] Create  [Esc] Back"))
+	return dialogBoxStyle.Render(b.String())
+}
+
+func (m *Model) viewDeleteOverlay() string {
+	if m.selectedSession == nil {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(dialogTitleStyle.Render("Delete Session"))
+	b.WriteString("\n\n")
+	b.WriteString(dialogTextStyle.Render(fmt.Sprintf("Delete \"%s\"?", m.selectedSession.Name)))
+	b.WriteString("\n\n")
+	b.WriteString(dialogTextStyle.Render("This will:"))
+	b.WriteString("\n")
+	b.WriteString(dialogTextStyle.Render("  - Kill the Claude process (if running)"))
+	b.WriteString("\n")
+	b.WriteString(dialogTextStyle.Render("  - Remove the git worktree"))
+	b.WriteString("\n")
+	b.WriteString(dialogTextStyle.Render("  - Delete all local changes"))
+	b.WriteString("\n\n")
+	b.WriteString(warningStyle.Render("This cannot be undone."))
+	b.WriteString("\n\n")
+	b.WriteString(dialogTextStyle.Render("[Y] Yes, delete    [N] Cancel"))
+	return dialogBoxStyle.Render(b.String())
+}
+
+func (m *Model) viewHelpOverlay() string {
+	var b strings.Builder
+	b.WriteString(titleStyle.Render("Keyboard Shortcuts"))
+	b.WriteString("\n\n")
+	b.WriteString(dialogTextStyle.Render("Sidebar:"))
+	b.WriteString("\n")
+	b.WriteString(dialogTextStyle.Render("  j/k or ↑/↓  Navigate sessions"))
+	b.WriteString("\n")
+	b.WriteString(dialogTextStyle.Render("  Enter        Start/resume session"))
+	b.WriteString("\n")
+	b.WriteString(dialogTextStyle.Render("  n            New session"))
+	b.WriteString("\n")
+	b.WriteString(dialogTextStyle.Render("  d            Delete session"))
+	b.WriteString("\n")
+	b.WriteString(dialogTextStyle.Render("  a            Archive session"))
+	b.WriteString("\n")
+	b.WriteString(dialogTextStyle.Render("  q            Quit ATC"))
+	b.WriteString("\n\n")
+	b.WriteString(dialogTextStyle.Render("Terminal:"))
+	b.WriteString("\n")
+	b.WriteString(dialogTextStyle.Render("  All keys forwarded to Claude"))
+	b.WriteString("\n")
+	b.WriteString(dialogTextStyle.Render("  Scroll/PgUp  Scroll up (enter scroll mode)"))
+	b.WriteString("\n")
+	b.WriteString(dialogTextStyle.Render("  Scroll/PgDn  Scroll down (any key exits)"))
+	b.WriteString("\n")
+	b.WriteString(dialogTextStyle.Render("  Click+drag   Select text (copies to clipboard)"))
+	b.WriteString("\n\n")
+	b.WriteString(dialogTextStyle.Render("Global:"))
+	b.WriteString("\n")
+	b.WriteString(dialogTextStyle.Render("  Ctrl+C       Back to sidebar (from terminal)"))
+	b.WriteString("\n\n")
+	b.WriteString(helpStyle.Render("Press Esc or ? to close"))
+	return dialogBoxStyle.Render(b.String())
+}
+
+func (m *Model) viewCreatingOverlay() string {
+	var b strings.Builder
+	b.WriteString(titleStyle.Render("Creating Session"))
+	b.WriteString("\n\n")
+	b.WriteString(m.spinner.View() + " Creating \"" + m.pendingSessionName + "\"...")
+	return dialogBoxStyle.Render(b.String())
+}
+
+// --- Archived sessions overlay ---
+
+func (m *Model) openArchivedOverlay() (tea.Model, tea.Cmd) {
+	m.archivedList = m.archivedSessionsList()
+	m.archivedCursor = 0
+	m.archivedScrollOffset = 0
+	m.overlay = overlayArchivedSessions
+	return m, nil
+}
+
+func (m *Model) handleArchivedOverlayKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
-	case "y", "Y":
-		// User wants to create a new session from this branch
-		// Transition to new session name input
-		m.newSessionInput = textinput.New()
-		m.newSessionInput.Placeholder = "Enter new session name..."
-		m.newSessionInput.Focus()
-		m.newSessionInput.CharLimit = 100
-		m.newSessionInput.Width = 50
-		m.state = stateEnterNewSessionName
+	case "up", "k":
+		if m.archivedCursor > 0 {
+			m.archivedCursor--
+			// Adjust scroll
+			if m.archivedCursor < m.archivedScrollOffset {
+				m.archivedScrollOffset = m.archivedCursor
+			}
+		}
 		return m, nil
 
-	case "n", "N", "esc":
-		// Go back to branch selection
-		m.state = stateSelectExistingBranch
-		m.selectedBranchName = ""
+	case "down", "j":
+		if m.archivedCursor < len(m.archivedList)-1 {
+			m.archivedCursor++
+			// Adjust scroll
+			maxVisible := 10
+			if m.archivedCursor >= m.archivedScrollOffset+maxVisible {
+				m.archivedScrollOffset = m.archivedCursor - maxVisible + 1
+			}
+		}
+		return m, nil
+
+	case "u":
+		if len(m.archivedList) == 0 || m.archivedCursor >= len(m.archivedList) {
+			return m, nil
+		}
+		selected := m.archivedList[m.archivedCursor]
+		return m, func() tea.Msg {
+			if err := m.service.UnarchiveSession(selected.Name); err != nil {
+				return errMsg{err}
+			}
+			return sessionUnarchivedMsg{selected.Name}
+		}
+
+	case "d":
+		if len(m.archivedList) == 0 || m.archivedCursor >= len(m.archivedList) {
+			return m, nil
+		}
+		m.selectedSession = m.archivedList[m.archivedCursor]
+		m.deleteFromArchived = true
+		m.overlay = overlayDeleteConfirm
+		return m, nil
+
+	case "esc":
+		m.overlay = overlayNone
 		return m, nil
 
 	case "ctrl+c":
@@ -593,688 +1615,355 @@ func (m *Model) handleConfirmBranchWithSessionKeys(msg tea.KeyMsg) (tea.Model, t
 	return m, nil
 }
 
-func (m *Model) handleEnterNewSessionNameKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "ctrl+c":
-		return m, tea.Quit
+func (m *Model) viewArchivedOverlay() string {
+	var b strings.Builder
+	b.WriteString(titleStyle.Render("Archived Sessions"))
+	b.WriteString("\n\n")
 
-	case "esc":
-		// Go back to branch selection
-		m.state = stateSelectExistingBranch
-		m.selectedBranchName = ""
-		return m, nil
-
-	case "enter":
-		name := strings.TrimSpace(m.newSessionInput.Value())
-		if name == "" {
-			m.err = fmt.Errorf("session name cannot be empty")
-			return m, nil
-		}
-
-		// Validate name
-		if err := worktree.ValidateBranchName(name); err != nil {
-			m.err = fmt.Errorf("invalid session name: %w", err)
-			return m, nil
-		}
-
-		// Create session with new branch from the selected branch
-		m.pendingSessionName = name
-		return m, m.doCreateSession(m.selectedBranchName, false) // false = create new branch
-
-	default:
-		// Pass key to text input
-		var cmd tea.Cmd
-		m.newSessionInput, cmd = m.newSessionInput.Update(msg)
-		m.err = nil // Clear error on typing
-		return m, cmd
-	}
-}
-
-// filterBranches filters branches based on the branch input query
-func (m *Model) filterBranches() {
-	query := strings.ToLower(strings.TrimSpace(m.branchInput.Value()))
-
-	if query == "" {
-		m.filteredBranches = m.branches
+	if len(m.archivedList) == 0 {
+		b.WriteString(metadataStyle.Render("No archived sessions") + "\n")
 	} else {
-		m.filteredBranches = []string{}
-		for _, branch := range m.branches {
-			if strings.Contains(strings.ToLower(branch), query) {
-				m.filteredBranches = append(m.filteredBranches, branch)
+		maxVisible := 10
+		endIdx := m.archivedScrollOffset + maxVisible
+		if endIdx > len(m.archivedList) {
+			endIdx = len(m.archivedList)
+		}
+
+		if m.archivedScrollOffset > 0 {
+			b.WriteString(metadataStyle.Render(fmt.Sprintf("  ↑ %d more", m.archivedScrollOffset)) + "\n")
+		}
+
+		for i := m.archivedScrollOffset; i < endIdx; i++ {
+			s := m.archivedList[i]
+			if i == m.archivedCursor {
+				b.WriteString(selectedItemStyle.Render("▸ "+s.Name) + "\n")
+			} else {
+				b.WriteString(normalItemStyle.Render("  "+s.Name) + "\n")
 			}
 		}
+
+		if endIdx < len(m.archivedList) {
+			b.WriteString(metadataStyle.Render(fmt.Sprintf("  ↓ %d more", len(m.archivedList)-endIdx)) + "\n")
+		}
 	}
 
-	// Clamp cursor to valid range
-	maxCursor := len(m.filteredBranches)
-	if m.state == stateSelectBaseBranch {
-		// +1 for HEAD option in base branch selection
-		if m.branchCursor > maxCursor {
-			m.branchCursor = maxCursor
-		}
-	} else {
-		// For existing branch selection, all branches are selectable
-		if m.branchCursor >= maxCursor {
-			m.branchCursor = maxCursor - 1
-			if m.branchCursor < 0 {
-				m.branchCursor = 0
+	b.WriteString("\n")
+	b.WriteString(helpStyle.Render("[↑/↓] Navigate  [u] Unarchive  [d] Delete  [Esc] Close"))
+	return dialogBoxStyle.Render(b.String())
+}
+
+// --- View switching ---
+
+func (m *Model) switchViewToCurrentSession() tea.Cmd {
+	active := m.activeSessions()
+	if m.cursor >= 0 && m.cursor < len(active) {
+		sess := active[m.cursor]
+		m.activeSession = sess
+		if t, ok := m.terminals[sess.Name]; ok {
+			// Terminal exists (running or stopped) — just resize if running
+			if t.IsRunning() {
+				tw, th := m.terminalPaneDimensions()
+				t.Resize(tw, th)
 			}
+			return nil
+		}
+		// No terminal exists — auto-activate unless activation is already in flight
+		if m.activatingSession == sess.Name {
+			return nil
+		}
+		return m.activateSession(sess, false)
+	}
+	// If cursor is on the archived line, don't change activeSession
+	return nil
+}
+
+// renderOverlayOnTop centers the overlay on top of the background
+func (m *Model) renderOverlayOnTop(background, overlayStr string) string {
+	bgLines := strings.Split(background, "\n")
+	olLines := strings.Split(overlayStr, "\n")
+
+	olWidth := 0
+	for _, line := range olLines {
+		w := lipgloss.Width(line)
+		if w > olWidth {
+			olWidth = w
 		}
 	}
-	m.branchScrollOffset = 0
+
+	startRow := (m.windowHeight - len(olLines)) / 2
+	startCol := (m.windowWidth - olWidth) / 2
+	if startRow < 0 {
+		startRow = 0
+	}
+	if startCol < 0 {
+		startCol = 0
+	}
+
+	for len(bgLines) < m.windowHeight {
+		bgLines = append(bgLines, "")
+	}
+
+	for i, olLine := range olLines {
+		row := startRow + i
+		if row >= len(bgLines) {
+			break
+		}
+		// Preserve background content on both sides of the overlay
+		leftBg := truncateAnsi(bgLines[row], startCol)
+		// Pad left side if background is shorter than startCol
+		leftWidth := lipgloss.Width(leftBg)
+		if leftWidth < startCol {
+			leftBg += strings.Repeat(" ", startCol-leftWidth)
+		}
+		// Pad overlay line to consistent width
+		olVisWidth := lipgloss.Width(olLine)
+		paddedOl := olLine
+		if olVisWidth < olWidth {
+			paddedOl += strings.Repeat(" ", olWidth-olVisWidth)
+		}
+		// Get background content to the right of the overlay
+		rightBg := skipAnsi(bgLines[row], startCol+olWidth)
+		bgLines[row] = leftBg + paddedOl + rightBg
+	}
+
+	return strings.Join(bgLines[:m.windowHeight], "\n")
 }
 
-// adjustBranchScroll ensures the branch cursor is visible within the scroll window
-func (m *Model) adjustBranchScroll(totalItems int) {
-	maxVisible := m.maxVisibleBranches()
-	if maxVisible <= 0 {
-		maxVisible = 1
-	}
+// --- Utility ---
 
-	if m.branchCursor < m.branchScrollOffset {
-		m.branchScrollOffset = m.branchCursor
+func truncate(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
 	}
-
-	if m.branchCursor >= m.branchScrollOffset+maxVisible {
-		m.branchScrollOffset = m.branchCursor - maxVisible + 1
+	if maxLen <= 3 {
+		return s[:maxLen]
 	}
-
-	if m.branchScrollOffset < 0 {
-		m.branchScrollOffset = 0
-	}
+	return s[:maxLen-3] + "..."
 }
 
-// maxVisibleBranches returns how many branches can fit in the terminal
-func (m *Model) maxVisibleBranches() int {
-	if m.windowHeight <= fixedUILines {
-		return 1
+func centerText(s string, width int) string {
+	w := lipgloss.Width(s)
+	if w >= width {
+		return s
 	}
-	availableLines := m.windowHeight - fixedUILines
-	// Each branch is 1 line
-	maxBranches := availableLines
-
-	if maxBranches > maxSessionsVisible {
-		maxBranches = maxSessionsVisible
-	}
-	return maxBranches
+	pad := (width - w) / 2
+	return strings.Repeat(" ", pad) + s
 }
 
-func (m *Model) filterSessions() {
-	query := strings.ToLower(strings.TrimSpace(m.textInput.Value()))
+func stripANSI(s string) string {
+	return ansiRegex.ReplaceAllString(s, "")
+}
 
-	// Partition sessions into active and archived, filtering by query
-	var active, archived []*session.Session
-	for _, s := range m.sessions {
-		if query != "" && !strings.Contains(strings.ToLower(s.Name), query) {
+// ansiEscapeEnd returns the byte index just past the ANSI escape sequence
+// starting at s[i] (where s[i] == '\x1b'). Handles CSI (\x1b[...X) and
+// charset (\x1b(X) sequences.
+func ansiEscapeEnd(s string, i int) int {
+	j := i + 1
+	if j >= len(s) {
+		return j
+	}
+	if s[j] == '[' {
+		j++
+		for j < len(s) && !((s[j] >= 'A' && s[j] <= 'Z') || (s[j] >= 'a' && s[j] <= 'z')) {
+			j++
+		}
+		if j < len(s) {
+			j++
+		}
+	} else if s[j] == '(' {
+		j += 2
+		if j > len(s) {
+			j = len(s)
+		}
+	}
+	return j
+}
+
+// truncateAnsi returns the first maxWidth visible characters of s,
+// preserving any ANSI escape sequences encountered along the way.
+func truncateAnsi(s string, maxWidth int) string {
+	var result strings.Builder
+	visCol := 0
+	i := 0
+	for i < len(s) && visCol < maxWidth {
+		if s[i] == '\x1b' && i+1 < len(s) {
+			j := ansiEscapeEnd(s, i)
+			result.WriteString(s[i:j])
+			i = j
 			continue
 		}
-		if s.Status == "archived" {
-			archived = append(archived, s)
+		_, size := utf8.DecodeRuneInString(s[i:])
+		result.WriteString(s[i : i+size])
+		i += size
+		visCol++
+	}
+	return result.String()
+}
+
+// skipAnsi skips past the first skip visible characters in s and returns
+// the remainder, including any ANSI sequences that appear after the skip point.
+func skipAnsi(s string, skip int) string {
+	visCol := 0
+	i := 0
+	for i < len(s) && visCol < skip {
+		if s[i] == '\x1b' && i+1 < len(s) {
+			i = ansiEscapeEnd(s, i)
+			continue
+		}
+		_, size := utf8.DecodeRuneInString(s[i:])
+		i += size
+		visCol++
+	}
+	return s[i:]
+}
+
+// --- Text selection ---
+
+// normalizedSelection returns selection coordinates with start before end.
+func (m *Model) normalizedSelection() (startRow, startCol, endRow, endCol int) {
+	startRow, startCol = m.selStartRow, m.selStartCol
+	endRow, endCol = m.selEndRow, m.selEndCol
+	if startRow > endRow || (startRow == endRow && startCol > endCol) {
+		startRow, startCol, endRow, endCol = endRow, endCol, startRow, startCol
+	}
+	return
+}
+
+// applySelectionHighlight overlays reverse video on the selected text region.
+func (m *Model) applySelectionHighlight(content string) string {
+	lines := strings.Split(content, "\n")
+	startRow, startCol, endRow, endCol := m.normalizedSelection()
+
+	for i := startRow; i <= endRow && i < len(lines); i++ {
+		if i < 0 {
+			continue
+		}
+		lsc := 0
+		lec := -1 // will be set below
+
+		if i == startRow {
+			lsc = startCol
+		}
+		if i == endRow {
+			lec = endCol
 		} else {
-			active = append(active, s)
+			// Full line — select to the end
+			stripped := stripANSI(lines[i])
+			lec = utf8.RuneCountInString(stripped) - 1
+		}
+		if lec < lsc {
+			continue
+		}
+
+		lines[i] = applyReverseVideoToLine(lines[i], lsc, lec)
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+// applyReverseVideoToLine inserts ANSI reverse video escape codes around
+// visible columns [startCol, endCol] (inclusive) in a line that may contain ANSI escapes.
+func applyReverseVideoToLine(line string, startCol, endCol int) string {
+	var result strings.Builder
+	visCol := 0
+	inReverse := false
+	i := 0
+
+	for i < len(line) {
+		if line[i] == '\x1b' && i+1 < len(line) {
+			j := ansiEscapeEnd(line, i)
+			result.WriteString(line[i:j])
+			i = j
+			continue
+		}
+
+		if !inReverse && visCol >= startCol && visCol <= endCol {
+			result.WriteString("\x1b[7m")
+			inReverse = true
+		}
+
+		r, size := utf8.DecodeRuneInString(line[i:])
+		result.WriteRune(r)
+		i += size
+		visCol++
+
+		if inReverse && visCol > endCol {
+			result.WriteString("\x1b[27m")
+			inReverse = false
 		}
 	}
 
-	// Display order: active sessions first, then archived
-	m.filteredSessions = append(active, archived...)
-
-	// Clamp cursor to valid range
-	if maxCursor := len(m.filteredSessions); m.cursor > maxCursor {
-		m.cursor = maxCursor
+	if inReverse {
+		result.WriteString("\x1b[27m")
 	}
-	m.adjustScroll()
+
+	return result.String()
 }
 
-// maxVisibleSessions returns how many sessions can fit in the terminal
-func (m *Model) maxVisibleSessions() int {
-	if m.windowHeight <= fixedUILines {
-		return 1
+// getSelectedText returns the plain text of the current selection.
+func (m *Model) getSelectedText() string {
+	if m.activeSession == nil {
+		return ""
 	}
-	availableLines := m.windowHeight - fixedUILines
-	maxSessions := availableLines / linesPerSession
-
-	if maxSessions > maxSessionsVisible {
-		maxSessions = maxSessionsVisible
-	}
-	return maxSessions
-}
-
-// adjustScroll ensures the cursor is visible within the scroll window
-func (m *Model) adjustScroll() {
-	maxVisible := m.maxVisibleSessions()
-	if maxVisible <= 0 {
-		maxVisible = 1
-	}
-
-	// If cursor is above visible area, scroll up
-	if m.cursor < m.scrollOffset {
-		m.scrollOffset = m.cursor
-	}
-
-	// If cursor is below visible area, scroll down
-	if m.cursor >= m.scrollOffset+maxVisible {
-		m.scrollOffset = m.cursor - maxVisible + 1
-	}
-
-	// Ensure scroll offset is not negative
-	if m.scrollOffset < 0 {
-		m.scrollOffset = 0
-	}
-}
-
-func (m *Model) View() string {
-	switch m.state {
-	case stateMain:
-		return m.viewMain()
-	case stateCreating:
-		return m.viewCreating()
-	case stateConfirmDelete:
-		return m.viewConfirmDelete()
-	case stateSelectBaseBranch:
-		return m.viewSelectBaseBranch()
-	case stateSelectExistingBranch:
-		return m.viewSelectExistingBranch()
-	case stateConfirmBranchWithSession:
-		return m.viewConfirmBranchWithSession()
-	case stateEnterNewSessionName:
-		return m.viewEnterNewSessionName()
-	}
-	return ""
-}
-
-func (m *Model) viewMain() string {
-	var content strings.Builder
-	divider := dividerStyle.Render(strings.Repeat("─", contentWidth))
-	pad := " " // Manual padding since container has none
-
-	// Repo name (right-aligned)
-	repoNameStyled := subtitleStyle.Render("repo: " + m.repoName)
-	repoNameWidth := lipgloss.Width(repoNameStyled)
-	repoNamePadding := contentWidth - repoNameWidth - 1 // -1 for right margin
-	if repoNamePadding < 0 {
-		repoNamePadding = 0
-	}
-	content.WriteString(strings.Repeat(" ", repoNamePadding) + repoNameStyled + "\n")
-	// Input
-	content.WriteString(pad + m.textInput.View() + "\n")
-	// Error/Message right under search bar (always reserve this line for consistent height)
-	if m.err != nil {
-		content.WriteString(pad + errorStyle.Render(fmt.Sprintf("Error: %s", m.err.Error())))
-	} else if m.message != "" {
-		content.WriteString(pad + successStyle.Render(m.message))
-	} else {
-		content.WriteString(pad)
-	}
-	content.WriteString("\n")
-	// Divider before session list
-	content.WriteString(divider + "\n")
-
-	// "Create new" option (always visible, position 0)
-	createNewText := fmt.Sprintf("+ New session \"%s\"", m.textInput.Value())
-	if m.cursor == 0 {
-		content.WriteString(pad + selectedItemStyle.Render("▶ " + createNewText))
-	} else {
-		content.WriteString(pad + createNewStyle.Render("  " + createNewText))
-	}
-	content.WriteString("\n")
-
-	// Calculate visible range
-	maxVisible := m.maxVisibleSessions()
-	totalSessions := len(m.filteredSessions)
-
-	// Always show scroll indicator line (empty if nothing above)
-	if m.scrollOffset > 0 {
-		content.WriteString(pad + metadataStyle.Render(fmt.Sprintf("  ↑ %d more", m.scrollOffset)))
-	} else {
-		content.WriteString(pad) // Reserve space
-	}
-	content.WriteString("\n")
-
-	// Render visible sessions
-	endIdx := m.scrollOffset + maxVisible
-	if endIdx > totalSessions {
-		endIdx = totalSessions
-	}
-
-	sessionsRendered := 0
-	for i := m.scrollOffset; i < endIdx; i++ {
-		s := m.filteredSessions[i]
-		cursorPos := i + 1 // +1 for "Create new" option
-		m.renderSession(&content, s, cursorPos)
-		sessionsRendered++
-	}
-
-	// Add padding lines to fill terminal height (each session is 2 lines)
-	paddingNeeded := (maxVisible - sessionsRendered) * linesPerSession
-	// Account for remainder when available lines is odd
-	availableLines := m.windowHeight - fixedUILines
-	if availableLines > 0 && availableLines%linesPerSession != 0 {
-		paddingNeeded += availableLines % linesPerSession
-	}
-	for i := 0; i < paddingNeeded; i++ {
-		content.WriteString(pad + "\n")
-	}
-
-	// Always show scroll indicator line (empty if nothing below)
-	if endIdx < totalSessions {
-		content.WriteString(pad + metadataStyle.Render(fmt.Sprintf("  ↓ %d more", totalSessions-endIdx)))
-	} else {
-		content.WriteString(pad) // Reserve space
-	}
-	content.WriteString("\n")
-
-	// Help text (divider then instructions on two rows)
-	content.WriteString(divider + "\n")
-	content.WriteString(pad + helpStyle.Render("[↑/↓] Navigate  [Enter] Select  [^B] From branch"))
-	content.WriteString("\n")
-	content.WriteString(pad + helpStyle.Render("[^D] Delete  [^A] Archive  [Esc] Quit"))
-	content.WriteString("\n")
-
-	// Build the box manually for full control (no lipgloss border)
-
-	// Top border with embedded title
-	title := titleStyle.Render("🛫 Air Traffic Control") + " " + subtitleStyle.Render("v"+Version)
-	topLeft := borderStyle.Render("╭─ ")
-	titleWidth := lipgloss.Width(topLeft) + lipgloss.Width(title) + 2 // +2 for space and closing corner
-	dashCount := contentWidth - titleWidth + 2                        // +2 for side borders
-	if dashCount < 1 {
-		dashCount = 1
-	}
-	topRight := borderStyle.Render(" " + strings.Repeat("─", dashCount) + "╮")
-	topBorder := topLeft + title + topRight
-
-	// Wrap each content line with side borders
-	lines := strings.Split(content.String(), "\n")
-	var body strings.Builder
-	body.WriteString(topBorder + "\n")
-	leftBorder := borderStyle.Render("│")
-	rightBorder := borderStyle.Render("│")
-	for _, line := range lines {
-		if line == "" {
-			continue // Skip empty lines
-		}
-		// Use lipgloss.Width for visual width (handles ANSI codes)
-		visualWidth := lipgloss.Width(line)
-		padding := contentWidth - visualWidth
-		if padding < 0 {
-			padding = 0
-		}
-		body.WriteString(leftBorder + line + strings.Repeat(" ", padding) + rightBorder + "\n")
-	}
-
-	// Bottom border
-	body.WriteString(borderStyle.Render("╰" + strings.Repeat("─", contentWidth) + "╯"))
-
-	return body.String()
-}
-
-func (m *Model) renderSession(b *strings.Builder, s *session.Session, cursorPos int) {
-	pad := " " // Manual padding
-	cursor := "  "
-	style := normalItemStyle
-	metaStyle := metadataStyle
-	if m.cursor == cursorPos {
-		cursor = "▶ "
-		style = selectedItemStyle
-	}
-
-	if s.Status == "archived" {
-		style = archivedItemStyle
-		metaStyle = archivedItemStyle
-	}
-
-	// Session name
-	b.WriteString(pad + style.Render(cursor+s.Name))
-	b.WriteString("\n")
-
-	// Metadata line: summary (if any) + time
-	var timeStr string
-	if s.ArchivedAt != nil {
-		timeStr = "archived " + formatTime(*s.ArchivedAt)
-	} else if s.LastAccessed != nil {
-		timeStr = formatTime(*s.LastAccessed)
-	} else {
-		timeStr = formatTime(s.CreatedAt)
-	}
-
-	// Get conversation summary
-	summary := worktree.GetConversationSummary(s.WorktreePath)
-	var metaLine string
-	if summary != "" {
-		if len(summary) > summaryMaxLen {
-			summary = summary[:summaryTruncateAt] + "..."
-		}
-		metaLine = fmt.Sprintf("    %s · %s", summary, timeStr)
-	} else {
-		metaLine = "    " + timeStr
-	}
-	b.WriteString(pad + metaStyle.Render(metaLine))
-	b.WriteString("\n")
-}
-
-func (m *Model) viewCreating() string {
-	var content strings.Builder
-
-	header := titleStyle.Render("✈ Air Traffic Control")
-	content.WriteString(headerStyle.Render(header))
-	content.WriteString("\n\n")
-
-	content.WriteString(statusStyle.Render(fmt.Sprintf("%s Creating \"%s\"...", m.spinner.View(), m.textInput.Value())))
-	content.WriteString("\n\n")
-
-	if m.createOutput != "" {
-		content.WriteString(dialogTextStyle.Render(m.createOutput))
-	}
-
-	return containerStyle.Render(content.String())
-}
-
-func (m *Model) viewConfirmDelete() string {
-	if m.selectedSession == nil {
+	t, ok := m.terminals[m.activeSession.Name]
+	if !ok {
 		return ""
 	}
 
-	var b strings.Builder
-
-	b.WriteString(dialogTitleStyle.Render("Delete Session"))
-	b.WriteString("\n\n")
-
-	b.WriteString(dialogTextStyle.Render(fmt.Sprintf("Delete \"%s\"?", m.selectedSession.Name)))
-	b.WriteString("\n\n")
-
-	b.WriteString(dialogTextStyle.Render("This will:"))
-	b.WriteString("\n")
-	b.WriteString(dialogTextStyle.Render("  • Remove the git worktree"))
-	b.WriteString("\n")
-	b.WriteString(dialogTextStyle.Render("  • Delete all local changes"))
-	b.WriteString("\n")
-	b.WriteString(dialogTextStyle.Render("  • Remove the session"))
-	b.WriteString("\n\n")
-
-	b.WriteString(warningStyle.Render("This cannot be undone."))
-	b.WriteString("\n\n")
-
-	b.WriteString(dialogTextStyle.Render("[Y] Yes, delete    [N] Cancel"))
-
-	return dialogBoxStyle.Render(b.String())
-}
-
-func (m *Model) viewSelectBaseBranch() string {
-	var content strings.Builder
-	divider := dividerStyle.Render(strings.Repeat("─", contentWidth))
-	pad := " "
-
-	titleLine := fmt.Sprintf("Creating session \"%s\"", m.pendingSessionName)
-	content.WriteString(pad + titleStyle.Render(titleLine) + "\n")
-	content.WriteString(pad + subtitleStyle.Render("Select base branch:") + "\n")
-	content.WriteString(pad + m.branchInput.View() + "\n")
-	content.WriteString(pad + "\n")
-	content.WriteString(divider + "\n")
-	content.WriteString(pad + "\n")
-
-	showHead := m.showHeadOption()
-	if showHead {
-		headLabel := fmt.Sprintf("HEAD (%s)", m.currentBranch)
-		if m.branchCursor == 0 {
-			content.WriteString(pad + selectedItemStyle.Render("▶ "+headLabel) + "\n")
-		} else {
-			content.WriteString(pad + normalItemStyle.Render("  "+headLabel) + "\n")
-		}
-	}
-
-	// Calculate visible range for branches
-	maxVisible := m.maxVisibleBranches() - 1 // -1 for HEAD option
-	if maxVisible < 1 {
-		maxVisible = 1
-	}
-	totalBranches := len(m.filteredBranches)
-
-	// Adjust scroll for branch list (cursor 1+ maps to branches, or 0+ if HEAD hidden)
-	cursorOffset := 0
-	if showHead {
-		cursorOffset = 1
-	}
-	branchCursor := m.branchCursor - cursorOffset // Convert to branch index
-	startIdx := m.branchScrollOffset
-	if branchCursor >= 0 {
-		if branchCursor < startIdx {
-			startIdx = branchCursor
-		}
-		if branchCursor >= startIdx+maxVisible {
-			startIdx = branchCursor - maxVisible + 1
-		}
-	}
-	endIdx := startIdx + maxVisible
-	if endIdx > totalBranches {
-		endIdx = totalBranches
-	}
-
-	// Scroll up indicator
-	if startIdx > 0 {
-		content.WriteString(pad + metadataStyle.Render(fmt.Sprintf("  ↑ %d more", startIdx)) + "\n")
-	}
-
-	// Render visible branches
-	for i := startIdx; i < endIdx; i++ {
-		branch := m.filteredBranches[i]
-		cursorPos := i + cursorOffset // Adjust for HEAD option
-		if m.branchCursor == cursorPos {
-			content.WriteString(pad + selectedItemStyle.Render("▶ "+branch) + "\n")
-		} else {
-			content.WriteString(pad + normalItemStyle.Render("  "+branch) + "\n")
-		}
-	}
-
-	// Scroll down indicator
-	if endIdx < totalBranches {
-		content.WriteString(pad + metadataStyle.Render(fmt.Sprintf("  ↓ %d more", totalBranches-endIdx)) + "\n")
-	}
-
-	content.WriteString(pad + "\n")
-	content.WriteString(divider + "\n")
-	content.WriteString(pad + helpStyle.Render("[↑/↓] Navigate  [Enter] Select  [Esc] Cancel") + "\n")
-
-	return m.wrapInBox(content.String())
-}
-
-func (m *Model) viewSelectExistingBranch() string {
-	var content strings.Builder
-	divider := dividerStyle.Render(strings.Repeat("─", contentWidth))
-	pad := " "
-
-	// Title and input
-	content.WriteString(pad + titleStyle.Render("Create session from existing branch:") + "\n")
-	content.WriteString(pad + m.branchInput.View() + "\n")
-	content.WriteString(divider + "\n")
-
-	// Calculate how many branches we can show
-	// Fixed lines: title(1) + input(1) + divider(1) + divider(1) + help(1) + borders(2) = 8
-	branchAreaHeight := m.windowHeight - 8
-	if branchAreaHeight < 1 {
-		branchAreaHeight = 1
-	}
-	if branchAreaHeight > maxSessionsVisible {
-		branchAreaHeight = maxSessionsVisible
-	}
-
-	totalBranches := len(m.filteredBranches)
-
-	if totalBranches == 0 {
-		content.WriteString(pad + metadataStyle.Render("  No branches match filter") + "\n")
-	} else {
-		// Calculate scroll window
-		startIdx := m.branchScrollOffset
-		if m.branchCursor < startIdx {
-			startIdx = m.branchCursor
-		}
-		if m.branchCursor >= startIdx+branchAreaHeight {
-			startIdx = m.branchCursor - branchAreaHeight + 1
-		}
-		if startIdx < 0 {
-			startIdx = 0
-		}
-		endIdx := startIdx + branchAreaHeight
-		if endIdx > totalBranches {
-			endIdx = totalBranches
-		}
-
-		// Scroll up indicator
-		if startIdx > 0 {
-			content.WriteString(pad + metadataStyle.Render(fmt.Sprintf("  ↑ %d more", startIdx)) + "\n")
-		}
-
-		// Render visible branches
-		for i := startIdx; i < endIdx; i++ {
-			branch := m.filteredBranches[i]
-			hasSession := m.branchesWithSessions[branch]
-
-			displayName := branch
-			if hasSession {
-				displayName = "● " + branch
-			}
-
-			if m.branchCursor == i {
-				content.WriteString(pad + selectedItemStyle.Render("▶ "+displayName) + "\n")
-			} else {
-				content.WriteString(pad + normalItemStyle.Render("  "+displayName) + "\n")
-			}
-		}
-
-		// Scroll down indicator
-		if endIdx < totalBranches {
-			content.WriteString(pad + metadataStyle.Render(fmt.Sprintf("  ↓ %d more", totalBranches-endIdx)) + "\n")
-		}
-	}
-
-	content.WriteString(divider + "\n")
-	content.WriteString(pad + helpStyle.Render("[↑/↓] Navigate  [Enter] Select  [Esc] Cancel  ● has session"))
-
-	return m.wrapInBox(content.String())
-}
-
-func (m *Model) viewConfirmBranchWithSession() string {
-	var b strings.Builder
-
-	b.WriteString(dialogTitleStyle.Render("Branch Has Existing Session"))
-	b.WriteString("\n\n")
-
-	b.WriteString(dialogTextStyle.Render(fmt.Sprintf("Branch \"%s\" already has a session.", m.selectedBranchName)))
-	b.WriteString("\n\n")
-
-	b.WriteString(dialogTextStyle.Render("Would you like to create a new session"))
-	b.WriteString("\n")
-	b.WriteString(dialogTextStyle.Render("branching from this branch?"))
-	b.WriteString("\n\n")
-
-	b.WriteString(dialogTextStyle.Render("[Y] Yes, create new branch    [N] Cancel"))
-
-	return dialogBoxStyle.Render(b.String())
-}
-
-func (m *Model) viewEnterNewSessionName() string {
-	var content strings.Builder
-	divider := dividerStyle.Render(strings.Repeat("─", contentWidth))
-	pad := " "
-
-	// Title
-	content.WriteString(pad + titleStyle.Render(fmt.Sprintf("New session from \"%s\"", m.selectedBranchName)) + "\n")
-	content.WriteString(pad + subtitleStyle.Render("Enter a name for the new session:") + "\n")
-	content.WriteString(pad + "\n")
-
-	// Input
-	content.WriteString(pad + m.newSessionInput.View() + "\n")
-	content.WriteString(pad + "\n")
-
-	// Error if any
-	if m.err != nil {
-		content.WriteString(pad + errorStyle.Render(fmt.Sprintf("Error: %s", m.err.Error())) + "\n")
-		content.WriteString(pad + "\n")
-	}
-
-	content.WriteString(divider + "\n")
-	content.WriteString(pad + helpStyle.Render("[Enter] Create  [Esc] Cancel") + "\n")
-
-	return m.wrapInBox(content.String())
-}
-
-// wrapInBox wraps content in the standard ATC border box
-func (m *Model) wrapInBox(content string) string {
-	// Top border with embedded title
-	title := titleStyle.Render("🛫 Air Traffic Control") + " " + subtitleStyle.Render("v"+Version)
-	topLeft := borderStyle.Render("╭─ ")
-	titleWidth := lipgloss.Width(topLeft) + lipgloss.Width(title) + 2 // +2 for space and closing corner
-	dashCount := contentWidth - titleWidth + 2                        // +2 for side borders
-	if dashCount < 1 {
-		dashCount = 1
-	}
-	topRight := borderStyle.Render(" " + strings.Repeat("─", dashCount) + "╮")
-	topBorder := topLeft + title + topRight
-
-	// Wrap each content line with side borders
+	content := t.Render()
 	lines := strings.Split(content, "\n")
-	var body strings.Builder
-	body.WriteString(topBorder + "\n")
-	leftBorder := borderStyle.Render("│")
-	rightBorder := borderStyle.Render("│")
-	for _, line := range lines {
-		if line == "" {
+	startRow, startCol, endRow, endCol := m.normalizedSelection()
+
+	var sb strings.Builder
+	for i := startRow; i <= endRow && i < len(lines); i++ {
+		if i < 0 {
 			continue
 		}
-		visualWidth := lipgloss.Width(line)
-		padding := contentWidth - visualWidth
-		if padding < 0 {
-			padding = 0
+		stripped := stripANSI(lines[i])
+		runes := []rune(stripped)
+
+		lsc := 0
+		lec := len(runes)
+		if i == startRow {
+			lsc = startCol
 		}
-		body.WriteString(leftBorder + line + strings.Repeat(" ", padding) + rightBorder + "\n")
-	}
+		if i == endRow {
+			lec = endCol + 1
+		}
+		if lsc > len(runes) {
+			lsc = len(runes)
+		}
+		if lec > len(runes) {
+			lec = len(runes)
+		}
+		if lsc > lec {
+			continue
+		}
 
-	// Bottom border
-	body.WriteString(borderStyle.Render("╰" + strings.Repeat("─", contentWidth) + "╯"))
-
-	return body.String()
-}
-
-func formatTime(t time.Time) string {
-	diff := time.Since(t)
-
-	if diff < time.Minute {
-		return "just now"
-	}
-
-	type timeUnit struct {
-		threshold time.Duration
-		divisor   time.Duration
-		singular  string
-		plural    string
-	}
-
-	units := []timeUnit{
-		{time.Hour, time.Minute, "minute", "minutes"},
-		{24 * time.Hour, time.Hour, "hour", "hours"},
-		{7 * 24 * time.Hour, 24 * time.Hour, "day", "days"},
-		{30 * 24 * time.Hour, 7 * 24 * time.Hour, "week", "weeks"},
-		{365 * 24 * time.Hour, 30 * 24 * time.Hour, "month", "months"},
-	}
-
-	for _, unit := range units {
-		if diff < unit.threshold {
-			count := int(diff / unit.divisor)
-			if count == 1 {
-				return "1 " + unit.singular + " ago"
-			}
-			return fmt.Sprintf("%d %s ago", count, unit.plural)
+		sb.WriteString(string(runes[lsc:lec]))
+		if i < endRow {
+			sb.WriteString("\n")
 		}
 	}
 
-	// Fallback for very old times (over a year)
-	months := int(diff / (30 * 24 * time.Hour))
-	if months == 1 {
-		return "1 month ago"
-	}
-	return fmt.Sprintf("%d months ago", months)
+	return sb.String()
 }
 
-// GetCommandToExec returns the command that should be executed after TUI exits
-func (m *Model) GetCommandToExec() string {
-	return m.commandToExec
+// copySelectionToClipboard copies the selected text to the system clipboard.
+func (m *Model) copySelectionToClipboard() {
+	text := m.getSelectedText()
+	if text == "" {
+		return
+	}
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("pbcopy")
+	case "linux":
+		cmd = exec.Command("xclip", "-selection", "clipboard")
+	default:
+		return
+	}
+	cmd.Stdin = strings.NewReader(text)
+	cmd.Run()
 }
