@@ -22,16 +22,14 @@ type TerminalExitedMsg struct {
 // Terminal wraps a tmux session for a single Claude session.
 type Terminal struct {
 	socket  string // tmux socket name (shared across all terminals)
-	session string // tmux session name (unique per terminal)
+	name    string // tmux session name (unique per terminal)
 	program *tea.Program
-	name    string
 	done    chan struct{}
 	mu      sync.Mutex
 	closed  bool
 
 	// Rendering
 	lastCapture string // last captured pane content (for change detection)
-	visWidth    int
 	visHeight   int
 
 	// Scrollback
@@ -42,8 +40,21 @@ type Terminal struct {
 	paneDead bool
 }
 
+// newTerminal creates a Terminal struct and starts its poll loop.
+func newTerminal(name string, width, height int, p *tea.Program, socket string) *Terminal {
+	t := &Terminal{
+		socket:    socket,
+		name:      name,
+		program:   p,
+		done:      make(chan struct{}),
+		visHeight: height,
+	}
+	go t.pollLoop()
+	return t
+}
+
 // New creates a tmux session running claude in the given worktree directory.
-// tmuxSocket is the shared socket name (e.g. "atc-<pid>").
+// tmuxSocket is the shared socket name (e.g. "atc-<hash>").
 func New(name, worktreePath string, width, height int, continueSession bool, p *tea.Program, tmuxSocket string) (*Terminal, error) {
 	cmd := "claude"
 	if continueSession {
@@ -67,18 +78,7 @@ func New(name, worktreePath string, width, height int, continueSession bool, p *
 	exec.Command("tmux", "-L", tmuxSocket, "set-option", "-t", name, "remain-on-exit", "on").Run()
 	exec.Command("tmux", "-L", tmuxSocket, "set-option", "-t", name, "history-limit", "50000").Run()
 
-	t := &Terminal{
-		socket:    tmuxSocket,
-		session:   name,
-		program:   p,
-		name:      name,
-		done:      make(chan struct{}),
-		visWidth:  width,
-		visHeight: height,
-	}
-
-	go t.pollLoop()
-	return t, nil
+	return newTerminal(name, width, height, p, tmuxSocket), nil
 }
 
 // pollLoop captures pane content periodically and sends Bubble Tea messages on change.
@@ -123,13 +123,13 @@ func (t *Terminal) pollLoop() {
 
 func (t *Terminal) capturePaneVisible() string {
 	out, _ := exec.Command("tmux", "-L", t.socket,
-		"capture-pane", "-t", t.session, "-p", "-e").Output()
+		"capture-pane", "-t", t.name, "-p", "-e").Output()
 	return string(out)
 }
 
 func (t *Terminal) capturePaneRange(startLine, endLine int) string {
 	out, _ := exec.Command("tmux", "-L", t.socket,
-		"capture-pane", "-t", t.session, "-p", "-e",
+		"capture-pane", "-t", t.name, "-p", "-e",
 		"-S", fmt.Sprintf("%d", startLine),
 		"-E", fmt.Sprintf("%d", endLine)).Output()
 	return string(out)
@@ -137,13 +137,13 @@ func (t *Terminal) capturePaneRange(startLine, endLine int) string {
 
 func (t *Terminal) isPaneDead() bool {
 	out, _ := exec.Command("tmux", "-L", t.socket,
-		"display-message", "-t", t.session, "-p", "#{pane_dead}").Output()
+		"display-message", "-t", t.name, "-p", "#{pane_dead}").Output()
 	return strings.TrimSpace(string(out)) == "1"
 }
 
 func (t *Terminal) historySize() int {
 	out, _ := exec.Command("tmux", "-L", t.socket,
-		"display-message", "-t", t.session, "-p", "#{history_size}").Output()
+		"display-message", "-t", t.name, "-p", "#{history_size}").Output()
 	n := 0
 	fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &n)
 	return n
@@ -159,7 +159,7 @@ func (t *Terminal) SendKeys(msg tea.KeyMsg) {
 }
 
 func (t *Terminal) keyMsgToTmuxArgs(msg tea.KeyMsg) []string {
-	base := []string{"-L", t.socket, "send-keys", "-t", t.session}
+	base := []string{"-L", t.socket, "send-keys", "-t", t.name}
 
 	switch msg.Type {
 	case tea.KeyRunes:
@@ -271,12 +271,11 @@ func (t *Terminal) Render() string {
 // Resize updates the tmux session dimensions.
 func (t *Terminal) Resize(width, height int) {
 	t.mu.Lock()
-	t.visWidth = width
 	t.visHeight = height
 	t.mu.Unlock()
 
 	exec.Command("tmux", "-L", t.socket,
-		"resize-window", "-t", t.session,
+		"resize-window", "-t", t.name,
 		"-x", fmt.Sprintf("%d", width),
 		"-y", fmt.Sprintf("%d", height)).Run()
 }
@@ -295,7 +294,7 @@ func (t *Terminal) Respawn(continueSession bool) error {
 		cmd = "claude --continue"
 	}
 	err := exec.Command("tmux", "-L", t.socket,
-		"respawn-pane", "-t", t.session, "-k", cmd).Run()
+		"respawn-pane", "-t", t.name, "-k", cmd).Run()
 	if err != nil {
 		return err
 	}
@@ -305,16 +304,25 @@ func (t *Terminal) Respawn(continueSession bool) error {
 	return nil
 }
 
+// stopPollLoop stops the poll goroutine. Must be called with t.mu held.
+// Returns false if already stopped.
+func (t *Terminal) stopPollLoop() bool {
+	if t.closed {
+		return false
+	}
+	t.closed = true
+	close(t.done)
+	return true
+}
+
 // Close kills the tmux session and stops the poll loop.
 func (t *Terminal) Close() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.closed {
+	if !t.stopPollLoop() {
 		return nil
 	}
-	t.closed = true
-	close(t.done)
-	exec.Command("tmux", "-L", t.socket, "kill-session", "-t", t.session).Run()
+	exec.Command("tmux", "-L", t.socket, "kill-session", "-t", t.name).Run()
 	return nil
 }
 
@@ -366,29 +374,20 @@ func SessionExists(socket, name string) bool {
 }
 
 // Attach wraps an existing tmux session, resizes it, and starts polling for output.
-func Attach(name, worktreePath string, width, height int, p *tea.Program, tmuxSocket string) (*Terminal, error) {
+func Attach(name string, width, height int, p *tea.Program, tmuxSocket string) (*Terminal, error) {
 	// Resize to match current terminal pane
 	exec.Command("tmux", "-L", tmuxSocket,
 		"resize-window", "-t", name,
 		"-x", fmt.Sprintf("%d", width),
 		"-y", fmt.Sprintf("%d", height)).Run()
 
-	t := &Terminal{
-		socket:    tmuxSocket,
-		session:   name,
-		program:   p,
-		name:      name,
-		done:      make(chan struct{}),
-		visWidth:  width,
-		visHeight: height,
-	}
+	t := newTerminal(name, width, height, p, tmuxSocket)
 
 	// Check if the pane process has already exited
 	if t.isPaneDead() {
 		t.paneDead = true
 	}
 
-	go t.pollLoop()
 	return t, nil
 }
 
@@ -397,9 +396,5 @@ func Attach(name, worktreePath string, width, height int, p *tea.Program, tmuxSo
 func (t *Terminal) Detach() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.closed {
-		return
-	}
-	t.closed = true
-	close(t.done)
+	t.stopPollLoop()
 }

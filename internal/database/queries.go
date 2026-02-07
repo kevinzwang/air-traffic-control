@@ -41,29 +41,6 @@ func (db *DB) InsertSession(s *Session) error {
 	return nil
 }
 
-// GetSessionByID retrieves a session by its ID
-func (db *DB) GetSessionByID(id string) (*Session, error) {
-	query := `
-		SELECT id, name, repo_path, repo_name, worktree_path, branch_name,
-		       created_at, last_accessed, archived_at, status
-		FROM sessions
-		WHERE id = ?
-	`
-
-	var s Session
-	err := db.conn.QueryRow(query, id).Scan(
-		&s.ID, &s.Name, &s.RepoPath, &s.RepoName, &s.WorktreePath, &s.BranchName,
-		&s.CreatedAt, &s.LastAccessed, &s.ArchivedAt, &s.Status,
-	)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("session not found")
-	}
-	if err != nil {
-		return nil, fmt.Errorf("failed to get session: %w", err)
-	}
-	return &s, nil
-}
-
 // GetSessionByName retrieves a session by its name
 func (db *DB) GetSessionByName(name string) (*Session, error) {
 	query := `

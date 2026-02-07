@@ -55,7 +55,6 @@ type sessionsLoadedMsg struct {
 
 type sessionCreatedMsg struct {
 	session *session.Session
-	output  string
 }
 
 type sessionDeletedMsg struct {
@@ -113,7 +112,6 @@ type Model struct {
 	// Session creation fields
 	createInput        textinput.Model
 	pendingSessionName string
-	createOutput       string
 	selectAfterLoad    string // session name to select after next sessionsLoadedMsg
 	activatingSession  string // session name currently being activated (to prevent double-create)
 
@@ -170,6 +168,15 @@ func (m *Model) Init() tea.Cmd {
 		m.loadSessions(),
 		m.spinner.Tick,
 	)
+}
+
+// detachTerminal detaches the terminal for the given session name (stops polling)
+// and removes it from the terminals map. The tmux session keeps running.
+func (m *Model) detachTerminal(name string) {
+	if t, ok := m.terminals[name]; ok {
+		t.Detach()
+		delete(m.terminals, name)
+	}
 }
 
 // --- Data loading commands ---
@@ -273,7 +280,6 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case sessionCreatedMsg:
 		m.overlay = overlayNone
 		m.pendingSessionName = ""
-		m.createOutput = ""
 		m.selectAfterLoad = msg.session.Name
 		m.activatingSession = msg.session.Name
 		return m, tea.Batch(m.loadSessions(), m.activateSession(msg.session, true))
@@ -294,11 +300,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case sessionArchivedMsg:
 		m.message = fmt.Sprintf("Session '%s' archived", msg.name)
-		// Detach terminal (stop polling) but leave tmux session running
-		if t, ok := m.terminals[msg.name]; ok {
-			t.Detach()
-			delete(m.terminals, msg.name)
-		}
+		m.detachTerminal(msg.name)
 		if m.activeSession != nil && m.activeSession.Name == msg.name {
 			m.activeSession = nil
 		}
@@ -341,52 +343,53 @@ func (m *Model) activateSession(sess *session.Session, switchFocus bool) tea.Cmd
 
 		tw, th := m.terminalPaneDimensions()
 
-		// 1. If we have a running terminal wrapper → just resize
-		if t, ok := m.terminals[sess.Name]; ok && t.IsRunning() {
-			t.Resize(tw, th)
-			m.service.TouchSession(sess.Name)
-			m.activatingSession = ""
-			return nil
-		}
-
-		// 2. If wrapper exists but stopped → detach it, remove from map, fall through
-		if t, ok := m.terminals[sess.Name]; ok {
-			t.Detach()
-			delete(m.terminals, sess.Name)
-		}
-
-		// 3. If tmux session already exists on the socket → reattach
-		if terminal.SessionExists(m.tmuxSocket, sess.Name) {
-			t, err := terminal.Attach(sess.Name, sess.WorktreePath, tw, th, m.program, m.tmuxSocket)
-			if err != nil {
-				return errMsg{err}
-			}
-			m.terminals[sess.Name] = t
-			// If the pane process died while ATC was away, respawn with --continue
-			if !t.IsRunning() {
-				if err := t.Respawn(true); err != nil {
-					return errMsg{err}
-				}
-			}
-			m.service.TouchSession(sess.Name)
-			m.activatingSession = ""
-			return nil
-		}
-
-		// 4. No tmux session → create a new one
-		continueSession := worktree.HasExistingConversation(sess.WorktreePath)
-		t, err := terminal.New(sess.Name, sess.WorktreePath, tw, th, continueSession, m.program, m.tmuxSocket)
-		if err != nil {
+		if err := m.ensureTerminal(sess, tw, th); err != nil {
 			return errMsg{err}
 		}
-		m.terminals[sess.Name] = t
 
-		// Update last accessed time
 		m.service.TouchSession(sess.Name)
 		m.activatingSession = ""
-
 		return nil
 	}
+}
+
+// ensureTerminal guarantees a running terminal wrapper exists for the session.
+// It reuses an existing wrapper, reattaches to a persisted tmux session,
+// or creates a new tmux session as needed.
+func (m *Model) ensureTerminal(sess *session.Session, width, height int) error {
+	// If we have a running terminal wrapper, just resize
+	if t, ok := m.terminals[sess.Name]; ok && t.IsRunning() {
+		t.Resize(width, height)
+		return nil
+	}
+
+	// If wrapper exists but stopped, detach it before reattaching
+	m.detachTerminal(sess.Name)
+
+	// If tmux session already exists on the socket, reattach
+	if terminal.SessionExists(m.tmuxSocket, sess.Name) {
+		t, err := terminal.Attach(sess.Name, width, height, m.program, m.tmuxSocket)
+		if err != nil {
+			return err
+		}
+		m.terminals[sess.Name] = t
+		// If the pane process died while ATC was away, respawn with --continue
+		if !t.IsRunning() {
+			if err := t.Respawn(true); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	// No tmux session exists, create a new one
+	continueSession := worktree.HasExistingConversation(sess.WorktreePath)
+	t, err := terminal.New(sess.Name, sess.WorktreePath, width, height, continueSession, m.program, m.tmuxSocket)
+	if err != nil {
+		return err
+	}
+	m.terminals[sess.Name] = t
+	return nil
 }
 
 // --- Key handling ---
@@ -935,7 +938,6 @@ func (m *Model) handleHelpKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m *Model) doCreateSession(baseBranch string, useExisting bool) tea.Cmd {
 	name := m.pendingSessionName
 	m.overlay = overlayCreating
-	m.createOutput = ""
 
 	return func() tea.Msg {
 		var buf bytes.Buffer
@@ -943,10 +945,7 @@ func (m *Model) doCreateSession(baseBranch string, useExisting bool) tea.Cmd {
 		if err != nil {
 			return errMsg{err}
 		}
-		return sessionCreatedMsg{
-			session: sess,
-			output:  buf.String(),
-		}
+		return sessionCreatedMsg{session: sess}
 	}
 }
 
@@ -1755,6 +1754,31 @@ func stripANSI(s string) string {
 	return ansiRegex.ReplaceAllString(s, "")
 }
 
+// ansiEscapeEnd returns the byte index just past the ANSI escape sequence
+// starting at s[i] (where s[i] == '\x1b'). Handles CSI (\x1b[...X) and
+// charset (\x1b(X) sequences.
+func ansiEscapeEnd(s string, i int) int {
+	j := i + 1
+	if j >= len(s) {
+		return j
+	}
+	if s[j] == '[' {
+		j++
+		for j < len(s) && !((s[j] >= 'A' && s[j] <= 'Z') || (s[j] >= 'a' && s[j] <= 'z')) {
+			j++
+		}
+		if j < len(s) {
+			j++
+		}
+	} else if s[j] == '(' {
+		j += 2
+		if j > len(s) {
+			j = len(s)
+		}
+	}
+	return j
+}
+
 // truncateAnsi returns the first maxWidth visible characters of s,
 // preserving any ANSI escape sequences encountered along the way.
 func truncateAnsi(s string, maxWidth int) string {
@@ -1763,21 +1787,7 @@ func truncateAnsi(s string, maxWidth int) string {
 	i := 0
 	for i < len(s) && visCol < maxWidth {
 		if s[i] == '\x1b' && i+1 < len(s) {
-			j := i + 1
-			if s[j] == '[' {
-				j++
-				for j < len(s) && !((s[j] >= 'A' && s[j] <= 'Z') || (s[j] >= 'a' && s[j] <= 'z')) {
-					j++
-				}
-				if j < len(s) {
-					j++
-				}
-			} else if s[j] == '(' {
-				j += 2
-				if j > len(s) {
-					j = len(s)
-				}
-			}
+			j := ansiEscapeEnd(s, i)
 			result.WriteString(s[i:j])
 			i = j
 			continue
@@ -1797,22 +1807,7 @@ func skipAnsi(s string, skip int) string {
 	i := 0
 	for i < len(s) && visCol < skip {
 		if s[i] == '\x1b' && i+1 < len(s) {
-			j := i + 1
-			if s[j] == '[' {
-				j++
-				for j < len(s) && !((s[j] >= 'A' && s[j] <= 'Z') || (s[j] >= 'a' && s[j] <= 'z')) {
-					j++
-				}
-				if j < len(s) {
-					j++
-				}
-			} else if s[j] == '(' {
-				j += 2
-				if j > len(s) {
-					j = len(s)
-				}
-			}
-			i = j
+			i = ansiEscapeEnd(s, i)
 			continue
 		}
 		_, size := utf8.DecodeRuneInString(s[i:])
@@ -1875,29 +1870,13 @@ func applyReverseVideoToLine(line string, startCol, endCol int) string {
 	i := 0
 
 	for i < len(line) {
-		// Skip over ANSI escape sequences
 		if line[i] == '\x1b' && i+1 < len(line) {
-			j := i + 1
-			if line[j] == '[' {
-				j++
-				for j < len(line) && !((line[j] >= 'A' && line[j] <= 'Z') || (line[j] >= 'a' && line[j] <= 'z')) {
-					j++
-				}
-				if j < len(line) {
-					j++ // include terminating letter
-				}
-			} else if line[j] == '(' {
-				j += 2 // \x1b ( X
-				if j > len(line) {
-					j = len(line)
-				}
-			}
+			j := ansiEscapeEnd(line, i)
 			result.WriteString(line[i:j])
 			i = j
 			continue
 		}
 
-		// Visible character — check if we need to start/stop reverse video
 		if !inReverse && visCol >= startCol && visCol <= endCol {
 			result.WriteString("\x1b[7m")
 			inReverse = true

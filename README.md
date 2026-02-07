@@ -16,7 +16,7 @@ Manage agent "sessions", which tie together agents with code and git state. Let 
 - **Git Worktrees**: Each session runs in its own isolated git worktree
 - **Fuzzy Search**: Quickly find sessions by typing partial names
 - **Setup Commands**: Automatically run setup commands from `.cursor/worktrees.json`
-- **Session Persistence**: SQLite database tracks all sessions across restarts
+- **Session Persistence**: tmux sessions survive ATC restarts — quit and relaunch without interrupting running agents
 - **Text Selection**: Click and drag to select text, automatically copied to clipboard
 - **Scrollback**: Mouse wheel scrolling through terminal history
 - **Intuitive TUI**: Beautiful terminal interface built with Bubble Tea
@@ -114,7 +114,8 @@ air-traffic-control/
    - Saves session metadata to SQLite
 
 2. **Session Activation**:
-   - Spawns `claude` in a tmux session inside the session's worktree
+   - Reattaches to an existing tmux session if one is still running from a previous ATC instance
+   - Otherwise spawns `claude` (with `--continue` if a prior conversation exists) in a new tmux session
    - Terminal output is rendered via `tmux capture-pane` in the right pane
    - Keystrokes are forwarded via `tmux send-keys` for instant feedback
    - Use `Ctrl+C` to switch focus back to the session list

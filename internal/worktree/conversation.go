@@ -1,8 +1,6 @@
 package worktree
 
 import (
-	"bufio"
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -51,68 +49,3 @@ func HasExistingConversation(worktreePath string) bool {
 	return false
 }
 
-// GetConversationSummary returns the most recent conversation summary for a worktree.
-// Returns empty string if no conversation or summary found.
-func GetConversationSummary(worktreePath string) string {
-	projectDir := getClaudeProjectDir(worktreePath)
-	if projectDir == "" {
-		return ""
-	}
-
-	entries, err := os.ReadDir(projectDir)
-	if err != nil {
-		return ""
-	}
-
-	// Search all .jsonl files for summaries, return the last one found
-	var lastSummary string
-	for _, entry := range entries {
-		if strings.HasSuffix(entry.Name(), ".jsonl") {
-			filePath := filepath.Join(projectDir, entry.Name())
-			if summary := extractLastSummary(filePath); summary != "" {
-				lastSummary = summary
-			}
-		}
-	}
-
-	return lastSummary
-}
-
-// extractLastSummary reads a JSONL file and returns the last summary found
-func extractLastSummary(filePath string) string {
-	file, err := os.Open(filePath)
-	if err != nil {
-		return ""
-	}
-	defer file.Close()
-
-	var lastSummary string
-	scanner := bufio.NewScanner(file)
-	// Increase buffer size for large lines
-	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 1024*1024)
-
-	for scanner.Scan() {
-		line := scanner.Bytes()
-
-		// Quick check before parsing JSON
-		if !strings.Contains(string(line), `"summary"`) {
-			continue
-		}
-
-		var entry struct {
-			Type    string `json:"type"`
-			Summary string `json:"summary"`
-		}
-
-		if err := json.Unmarshal(line, &entry); err != nil {
-			continue
-		}
-
-		if entry.Type == "summary" && entry.Summary != "" {
-			lastSummary = entry.Summary
-		}
-	}
-
-	return lastSummary
-}

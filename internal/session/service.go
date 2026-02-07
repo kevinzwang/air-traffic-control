@@ -184,11 +184,6 @@ func (s *Service) ListBranches() ([]string, error) {
 	return worktree.ListBranches(s.repoPath)
 }
 
-// GetCurrentBranch returns the current HEAD branch name
-func (s *Service) GetCurrentBranch() (string, error) {
-	return worktree.GetCurrentBranch(s.repoPath)
-}
-
 // GetSessionByBranch returns a session for a given branch name, or nil if none exists
 func (s *Service) GetSessionByBranch(branchName string) (*Session, error) {
 	dbs, err := s.db.GetSessionByBranchName(branchName)

@@ -71,27 +71,6 @@ func DeleteWorktree(worktreePath string) error {
 	return nil
 }
 
-// ListWorktrees returns all worktrees for a repository
-func ListWorktrees(repoPath string) ([]string, error) {
-	cmd := exec.Command("git", "worktree", "list", "--porcelain")
-	cmd.Dir = repoPath
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return nil, fmt.Errorf("failed to list worktrees: %w", err)
-	}
-
-	worktrees := []string{}
-	lines := strings.Split(string(output), "\n")
-	for _, line := range lines {
-		if strings.HasPrefix(line, "worktree ") {
-			path := strings.TrimPrefix(line, "worktree ")
-			worktrees = append(worktrees, path)
-		}
-	}
-
-	return worktrees, nil
-}
-
 // ListBranches returns all local branch names for a repository
 func ListBranches(repoPath string) ([]string, error) {
 	cmd := exec.Command("git", "branch", "--format=%(refname:short)")
