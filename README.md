@@ -6,7 +6,7 @@ Air Traffic Control (ATC) is a TUI that helps you isolate and collaborate with m
 Manage agent "sessions", which tie together agents with code and git state. Let ATC automatically handle setup and management of git worktrees, and seamlessly spawn and move across agent conversations.
 
 <p align="center">
-  <img src="screenshot.png" width="50%" alt="ATC Screenshot">
+  <img src="screenshot.png" width="67%" alt="ATC Screenshot">
 </p>
 
 ## Features
