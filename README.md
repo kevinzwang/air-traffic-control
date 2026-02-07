@@ -11,11 +11,14 @@ Manage agent "sessions", which tie together agents with code and git state. Let 
 
 ## Features
 
+- **Embedded Terminal**: Claude Code sessions run inside a split-pane TUI via tmux — no more switching windows
 - **Session Management**: Create, list, archive, and delete Claude Code sessions
 - **Git Worktrees**: Each session runs in its own isolated git worktree
 - **Fuzzy Search**: Quickly find sessions by typing partial names
 - **Setup Commands**: Automatically run setup commands from `.cursor/worktrees.json`
 - **Session Persistence**: SQLite database tracks all sessions across restarts
+- **Text Selection**: Click and drag to select text, automatically copied to clipboard
+- **Scrollback**: Mouse wheel scrolling through terminal history
 - **Intuitive TUI**: Beautiful terminal interface built with Bubble Tea
 
 ## Installation
@@ -50,6 +53,7 @@ mv atc ~/.local/bin/  # or /usr/local/bin/
 ### Prerequisites
 
 - Git
+- [tmux](https://github.com/tmux/tmux)
 - Claude Code CLI (`claude`)
 
 ## Usage
@@ -95,9 +99,10 @@ air-traffic-control/
 ├── internal/
 │   ├── config/        # Config file parsing
 │   ├── database/      # SQLite operations
+│   ├── terminal/      # tmux session wrapper per session
 │   ├── worktree/      # Git worktree management
 │   ├── session/       # Business logic
-│   └── tui/           # Terminal UI
+│   └── tui/           # Terminal UI (split-pane layout)
 ```
 
 ## How It Works
@@ -108,12 +113,14 @@ air-traffic-control/
    - Runs setup commands from `.cursor/worktrees.json`
    - Saves session metadata to SQLite
 
-2. **Session Entry**:
-   - Updates last accessed timestamp
-   - Exits TUI and changes to worktree directory
-   - Executes `claude --continue` to resume conversation
+2. **Session Activation**:
+   - Spawns `claude` in a tmux session inside the session's worktree
+   - Terminal output is rendered via `tmux capture-pane` in the right pane
+   - Keystrokes are forwarded via `tmux send-keys` for instant feedback
+   - Use `Ctrl+C` to switch focus back to the session list
 
 3. **Session Deletion**:
+   - Kills the tmux session if running
    - Removes git worktree with `git worktree remove`
    - Deletes session record from database
 
@@ -174,6 +181,7 @@ go build -o atc ./cmd/atc
 - [Bubbles](https://github.com/charmbracelet/bubbles) - TUI components
 - [Lip Gloss](https://github.com/charmbracelet/lipgloss) - Styling
 - [go-sqlite3](https://github.com/mattn/go-sqlite3) - SQLite driver
+- [tmux](https://github.com/tmux/tmux) - Terminal multiplexer (runtime dependency)
 - [uuid](https://github.com/google/uuid) - UUID generation
 
 ## License

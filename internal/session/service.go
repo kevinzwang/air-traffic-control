@@ -39,6 +39,16 @@ func NewService(db *database.DB, repoPath string) (*Service, error) {
 	}, nil
 }
 
+// RepoName returns the repository name
+func (s *Service) RepoName() string {
+	return s.repoName
+}
+
+// RepoPath returns the repository path
+func (s *Service) RepoPath() string {
+	return s.repoPath
+}
+
 // CreateSession creates a new session with worktree and setup commands
 // baseBranch specifies the base for new branches (empty string defaults to HEAD)
 // useExistingBranch when true will attach to an existing branch instead of creating a new one
@@ -128,7 +138,8 @@ func (s *Service) GetSession(name string) (*Session, error) {
 	return fromDBSession(dbs), nil
 }
 
-// DeleteSession removes a session and its worktree
+// DeleteSession removes a session and its worktree.
+// The caller (TUI) is responsible for closing the terminal process first.
 func (s *Service) DeleteSession(name string) error {
 	session, err := s.GetSession(name)
 	if err != nil {
@@ -190,20 +201,19 @@ func (s *Service) GetSessionByBranch(branchName string) (*Session, error) {
 	return fromDBSession(dbs), nil
 }
 
-// EnterSession prepares to enter a session and returns the command to exec
-func (s *Service) EnterSession(name string) (string, error) {
+// TouchSession updates the last accessed time for a session
+func (s *Service) TouchSession(name string) error {
 	sess, err := s.GetSession(name)
 	if err != nil {
-		return "", err
+		return err
 	}
 
-	// Update last accessed time
 	now := time.Now()
 	sess.LastAccessed = &now
 
 	if err := s.db.UpdateSession(sess.toDBSession()); err != nil {
-		return "", fmt.Errorf("failed to update session: %w", err)
+		return fmt.Errorf("failed to update session: %w", err)
 	}
 
-	return worktree.GetClaudeCommand(sess.WorktreePath), nil
+	return nil
 }

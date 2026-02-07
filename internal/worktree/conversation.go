@@ -3,20 +3,10 @@ package worktree
 import (
 	"bufio"
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 )
-
-// GetClaudeCommand returns the command to cd to the worktree and exec claude.
-// Uses --continue if there's an existing conversation, otherwise starts fresh.
-func GetClaudeCommand(worktreePath string) string {
-	if HasExistingConversation(worktreePath) {
-		return fmt.Sprintf("cd %s && exec claude --continue", worktreePath)
-	}
-	return fmt.Sprintf("cd %s && exec claude", worktreePath)
-}
 
 // getClaudeProjectDir returns the Claude Code project directory for a worktree path.
 // Claude encodes paths by replacing / and . with -.

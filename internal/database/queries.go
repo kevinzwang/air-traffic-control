@@ -132,9 +132,7 @@ func (db *DB) ListSessions(repoFilter string, query string) ([]*Session, error) 
 		args = append(args, "%"+strings.ToLower(query)+"%")
 	}
 
-	// Order by status (active first), then by last accessed (most recent first)
-	// Use COALESCE to fall back to created_at for sessions never accessed
-	querySQL += " ORDER BY status DESC, COALESCE(last_accessed, created_at) DESC"
+	querySQL += " ORDER BY created_at DESC"
 
 	rows, err := db.conn.Query(querySQL, args...)
 	if err != nil {
