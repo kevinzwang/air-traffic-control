@@ -72,11 +72,16 @@ var (
 
 	// Dialog list items
 	selectedItemStyle = lipgloss.NewStyle().
-				Foreground(primary).
-				Bold(true)
+				Background(primary).
+				Foreground(lipgloss.Color("#000000")).
+				Bold(true).
+				PaddingLeft(1).
+				PaddingRight(1)
 
 	normalItemStyle = lipgloss.NewStyle().
-			Foreground(textNormal)
+			Foreground(textNormal).
+			PaddingLeft(1).
+			PaddingRight(1)
 
 	// --- General text styles ---
 
