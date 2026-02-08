@@ -152,6 +152,14 @@ If you manually delete a worktree directory, you can clean up git's records:
 git worktree prune
 ```
 
+### Option+Key Shortcuts Not Working (macOS)
+
+If shortcuts like Option+Delete (word deletion) or Option+Enter (newline) don't work inside ATC sessions, your terminal is likely not sending the Option key as an escape prefix.
+
+**iTerm2**: Go to **Settings → Profiles → Keys** and set **Left Option key** to **Esc+** (instead of "Normal").
+
+**Terminal.app**: Go to **Settings → Profiles → Keyboard** and check **Use Option as Meta key**.
+
 ### Database Issues
 
 If you encounter database corruption, you can reset it:
