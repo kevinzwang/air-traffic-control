@@ -1767,14 +1767,6 @@ func (m *Model) viewSelectBaseBranch() string {
 	b.WriteString("\n\n")
 
 	showHead := m.showHeadOption()
-	if showHead {
-		headLabel := fmt.Sprintf("HEAD (%s)", m.currentBranch)
-		if m.branchCursor == 0 {
-			b.WriteString(selectedItemStyle.Render("▸ "+headLabel) + "\n")
-		} else {
-			b.WriteString(normalItemStyle.Render("  "+headLabel) + "\n")
-		}
-	}
 
 	maxVisible := 10
 	startIdx := 0
@@ -1794,16 +1786,40 @@ func (m *Model) viewSelectBaseBranch() string {
 		endIdx = len(m.filteredBranches)
 	}
 
+	// Compute max item width for full-width highlight (match widest dialog element)
+	helpText := "[↑/↓] Navigate  [Enter] Select  [Esc] Back"
+	itemWidth := len(helpText)
+	if showHead {
+		w := len(fmt.Sprintf("HEAD (%s)", m.currentBranch))
+		if w > itemWidth {
+			itemWidth = w
+		}
+	}
+	for i := startIdx; i < endIdx; i++ {
+		if len(m.filteredBranches[i]) > itemWidth {
+			itemWidth = len(m.filteredBranches[i])
+		}
+	}
+
+	if showHead {
+		headLabel := fmt.Sprintf("HEAD (%s)", m.currentBranch)
+		if m.branchCursor == 0 {
+			b.WriteString(selectedItemStyle.Width(itemWidth).Render(headLabel) + "\n")
+		} else {
+			b.WriteString(normalItemStyle.Width(itemWidth).Render(headLabel) + "\n")
+		}
+	}
+
 	if startIdx > 0 {
-		b.WriteString(metadataStyle.Render(fmt.Sprintf("  ↑ %d more", startIdx)) + "\n")
+		b.WriteString(metadataStyle.Render("  ↑ "+fmt.Sprintf("%d more", startIdx)) + "\n")
 	}
 	for i := startIdx; i < endIdx; i++ {
 		branch := m.filteredBranches[i]
 		pos := i + cursorOffset
 		if m.branchCursor == pos {
-			b.WriteString(selectedItemStyle.Render("▸ "+branch) + "\n")
+			b.WriteString(selectedItemStyle.Width(itemWidth).Render(branch) + "\n")
 		} else {
-			b.WriteString(normalItemStyle.Render("  "+branch) + "\n")
+			b.WriteString(normalItemStyle.Width(itemWidth).Render(branch) + "\n")
 		}
 	}
 	if endIdx < len(m.filteredBranches) {
@@ -1811,7 +1827,7 @@ func (m *Model) viewSelectBaseBranch() string {
 	}
 
 	b.WriteString("\n")
-	b.WriteString(helpStyle.Render("[↑/↓] Navigate  [Enter] Select  [Esc] Back"))
+	b.WriteString(helpStyle.Render(helpText))
 	return dialogBoxStyle.Render(b.String())
 }
 
@@ -1835,29 +1851,46 @@ func (m *Model) viewSelectExistingBranch() string {
 	if len(m.filteredBranches) == 0 {
 		b.WriteString(metadataStyle.Render("  No branches match filter") + "\n")
 	} else {
+		// Compute max item width for full-width highlight (match widest dialog element)
+		helpText := "[↑/↓] Navigate  [Enter] Select  [Esc] Back  + has session"
+		itemWidth := len(helpText)
+		for i := startIdx; i < endIdx; i++ {
+			// Reserve space for " +" suffix on branches with sessions
+			w := len(m.filteredBranches[i]) + 2
+			if w > itemWidth {
+				itemWidth = w
+			}
+		}
+
 		if startIdx > 0 {
-			b.WriteString(metadataStyle.Render(fmt.Sprintf("  ↑ %d more", startIdx)) + "\n")
+			b.WriteString(metadataStyle.Render("  ↑ "+fmt.Sprintf("%d more", startIdx)) + "\n")
 		}
 		for i := startIdx; i < endIdx; i++ {
 			branch := m.filteredBranches[i]
 			hasSession := m.branchesWithSessions[branch]
 			displayName := branch
 			if hasSession {
-				displayName = "● " + branch
+				// itemWidth includes style padding (1 left + 1 right), so content area is itemWidth-2
+				contentWidth := itemWidth - 2
+				pad := contentWidth - len(branch) - 1
+				if pad < 1 {
+					pad = 1
+				}
+				displayName = branch + strings.Repeat(" ", pad) + "+"
 			}
 			if m.branchCursor == i {
-				b.WriteString(selectedItemStyle.Render("▸ "+displayName) + "\n")
+				b.WriteString(selectedItemStyle.Width(itemWidth).Render(displayName) + "\n")
 			} else {
-				b.WriteString(normalItemStyle.Render("  "+displayName) + "\n")
+				b.WriteString(normalItemStyle.Width(itemWidth).Render(displayName) + "\n")
 			}
 		}
 		if endIdx < len(m.filteredBranches) {
-			b.WriteString(metadataStyle.Render(fmt.Sprintf("  ↓ %d more", len(m.filteredBranches)-endIdx)) + "\n")
+			b.WriteString(metadataStyle.Render("  ↓ "+fmt.Sprintf("%d more", len(m.filteredBranches)-endIdx)) + "\n")
 		}
 	}
 
 	b.WriteString("\n")
-	b.WriteString(helpStyle.Render("[↑/↓] Navigate  [Enter] Select  [Esc] Back  ● has session"))
+	b.WriteString(helpStyle.Render("[↑/↓] Navigate  [Enter] Select  [Esc] Back  + has session"))
 	return dialogBoxStyle.Render(b.String())
 }
 
@@ -2037,12 +2070,21 @@ func (m *Model) viewArchivedOverlay() string {
 			b.WriteString(metadataStyle.Render(fmt.Sprintf("  ↑ %d more", m.archivedScrollOffset)) + "\n")
 		}
 
+		// Compute max item width for full-width highlight (match widest dialog element)
+		helpText := "[↑/↓] Navigate  [u] Unarchive  [d] Delete  [Esc] Close"
+		itemWidth := len(helpText)
+		for i := m.archivedScrollOffset; i < endIdx; i++ {
+			if len(m.archivedList[i].Name) > itemWidth {
+				itemWidth = len(m.archivedList[i].Name)
+			}
+		}
+
 		for i := m.archivedScrollOffset; i < endIdx; i++ {
 			s := m.archivedList[i]
 			if i == m.archivedCursor {
-				b.WriteString(selectedItemStyle.Render("▸ "+s.Name) + "\n")
+				b.WriteString(selectedItemStyle.Width(itemWidth).Render(s.Name) + "\n")
 			} else {
-				b.WriteString(normalItemStyle.Render("  "+s.Name) + "\n")
+				b.WriteString(normalItemStyle.Width(itemWidth).Render(s.Name) + "\n")
 			}
 		}
 
