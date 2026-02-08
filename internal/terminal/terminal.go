@@ -161,90 +161,293 @@ func (t *Terminal) SendKeys(msg tea.KeyMsg) {
 func (t *Terminal) keyMsgToTmuxArgs(msg tea.KeyMsg) []string {
 	base := []string{"-L", t.socket, "send-keys", "-t", t.name}
 
-	switch msg.Type {
-	case tea.KeyRunes:
+	// Alt+Runes: send ESC + rune as a single literal string so both bytes
+	// arrive in one PTY write. If they're split across writes, the process
+	// inside tmux may see a standalone Escape followed by the rune.
+	if msg.Type == tea.KeyRunes && msg.Alt {
+		return append(base, "-l", "\x1b"+string(msg.Runes))
+	}
+
+	// Regular runes (no Alt).
+	if msg.Type == tea.KeyRunes {
 		return append(base, "-l", string(msg.Runes))
+	}
+
+	// For Alt + single-byte keys (Enter, Backspace, Tab, Space, Escape,
+	// Ctrl+letter), we must send ESC + the key's byte as a single literal
+	// string via -l. tmux send-keys with separate args ("Escape" "Enter")
+	// writes them in separate PTY writes, and the app inside tmux parses
+	// the lone ESC as a standalone Escape key.
+	if msg.Alt {
+		if b := keyByte(msg.Type); b != 0 {
+			return append(base, "-l", "\x1b"+string([]byte{b}))
+		}
+	}
+
+	// Map key type to tmux key name.
+	var tmuxKey string
+	switch msg.Type {
 	case tea.KeyEnter:
-		return append(base, "Enter")
+		tmuxKey = "Enter"
 	case tea.KeyBackspace:
-		return append(base, "BSpace")
+		tmuxKey = "BSpace"
 	case tea.KeyTab:
-		return append(base, "Tab")
+		tmuxKey = "Tab"
+	case tea.KeyShiftTab:
+		tmuxKey = "BTab"
 	case tea.KeyEscape:
-		return append(base, "Escape")
-	case tea.KeyUp:
-		return append(base, "Up")
-	case tea.KeyDown:
-		return append(base, "Down")
-	case tea.KeyRight:
-		return append(base, "Right")
-	case tea.KeyLeft:
-		return append(base, "Left")
+		tmuxKey = "Escape"
 	case tea.KeySpace:
-		return append(base, "Space")
+		tmuxKey = "Space"
+
+	// Arrow keys
+	case tea.KeyUp:
+		tmuxKey = "Up"
+	case tea.KeyDown:
+		tmuxKey = "Down"
+	case tea.KeyRight:
+		tmuxKey = "Right"
+	case tea.KeyLeft:
+		tmuxKey = "Left"
+
+	// Shift+Arrow keys
+	case tea.KeyShiftUp:
+		tmuxKey = "S-Up"
+	case tea.KeyShiftDown:
+		tmuxKey = "S-Down"
+	case tea.KeyShiftLeft:
+		tmuxKey = "S-Left"
+	case tea.KeyShiftRight:
+		tmuxKey = "S-Right"
+
+	// Ctrl+Arrow keys
+	case tea.KeyCtrlUp:
+		tmuxKey = "C-Up"
+	case tea.KeyCtrlDown:
+		tmuxKey = "C-Down"
+	case tea.KeyCtrlLeft:
+		tmuxKey = "C-Left"
+	case tea.KeyCtrlRight:
+		tmuxKey = "C-Right"
+
+	// Ctrl+Shift+Arrow keys
+	case tea.KeyCtrlShiftUp:
+		tmuxKey = "C-S-Up"
+	case tea.KeyCtrlShiftDown:
+		tmuxKey = "C-S-Down"
+	case tea.KeyCtrlShiftLeft:
+		tmuxKey = "C-S-Left"
+	case tea.KeyCtrlShiftRight:
+		tmuxKey = "C-S-Right"
+
+	// Navigation keys
 	case tea.KeyHome:
-		return append(base, "Home")
+		tmuxKey = "Home"
 	case tea.KeyEnd:
-		return append(base, "End")
+		tmuxKey = "End"
+	case tea.KeyShiftHome:
+		tmuxKey = "S-Home"
+	case tea.KeyShiftEnd:
+		tmuxKey = "S-End"
+	case tea.KeyCtrlHome:
+		tmuxKey = "C-Home"
+	case tea.KeyCtrlEnd:
+		tmuxKey = "C-End"
+	case tea.KeyCtrlShiftHome:
+		tmuxKey = "C-S-Home"
+	case tea.KeyCtrlShiftEnd:
+		tmuxKey = "C-S-End"
+	case tea.KeyInsert:
+		tmuxKey = "IC"
 	case tea.KeyDelete:
-		return append(base, "DC")
+		tmuxKey = "DC"
 	case tea.KeyPgUp:
-		return append(base, "PPage")
+		tmuxKey = "PPage"
 	case tea.KeyPgDown:
-		return append(base, "NPage")
+		tmuxKey = "NPage"
+	case tea.KeyCtrlPgUp:
+		tmuxKey = "C-PPage"
+	case tea.KeyCtrlPgDown:
+		tmuxKey = "C-NPage"
+
+	// Function keys
+	case tea.KeyF1:
+		tmuxKey = "F1"
+	case tea.KeyF2:
+		tmuxKey = "F2"
+	case tea.KeyF3:
+		tmuxKey = "F3"
+	case tea.KeyF4:
+		tmuxKey = "F4"
+	case tea.KeyF5:
+		tmuxKey = "F5"
+	case tea.KeyF6:
+		tmuxKey = "F6"
+	case tea.KeyF7:
+		tmuxKey = "F7"
+	case tea.KeyF8:
+		tmuxKey = "F8"
+	case tea.KeyF9:
+		tmuxKey = "F9"
+	case tea.KeyF10:
+		tmuxKey = "F10"
+	case tea.KeyF11:
+		tmuxKey = "F11"
+	case tea.KeyF12:
+		tmuxKey = "F12"
+	case tea.KeyF13:
+		tmuxKey = "F13"
+	case tea.KeyF14:
+		tmuxKey = "F14"
+	case tea.KeyF15:
+		tmuxKey = "F15"
+	case tea.KeyF16:
+		tmuxKey = "F16"
+	case tea.KeyF17:
+		tmuxKey = "F17"
+	case tea.KeyF18:
+		tmuxKey = "F18"
+	case tea.KeyF19:
+		tmuxKey = "F19"
+	case tea.KeyF20:
+		tmuxKey = "F20"
+
+	// Ctrl+letter keys
 	case tea.KeyCtrlA:
-		return append(base, "C-a")
+		tmuxKey = "C-a"
 	case tea.KeyCtrlB:
-		return append(base, "C-b")
+		tmuxKey = "C-b"
 	case tea.KeyCtrlC:
-		return append(base, "C-c")
+		tmuxKey = "C-c"
 	case tea.KeyCtrlD:
-		return append(base, "C-d")
+		tmuxKey = "C-d"
 	case tea.KeyCtrlE:
-		return append(base, "C-e")
+		tmuxKey = "C-e"
 	case tea.KeyCtrlF:
-		return append(base, "C-f")
+		tmuxKey = "C-f"
 	case tea.KeyCtrlG:
-		return append(base, "C-g")
+		tmuxKey = "C-g"
 	case tea.KeyCtrlH:
-		return append(base, "C-h")
+		tmuxKey = "C-h"
 	// KeyCtrlI = Tab, handled above
 	case tea.KeyCtrlJ:
-		return append(base, "C-j")
+		tmuxKey = "C-j"
 	case tea.KeyCtrlK:
-		return append(base, "C-k")
+		tmuxKey = "C-k"
 	case tea.KeyCtrlL:
-		return append(base, "C-l")
+		tmuxKey = "C-l"
 	// KeyCtrlM = Enter, handled above
 	case tea.KeyCtrlN:
-		return append(base, "C-n")
+		tmuxKey = "C-n"
 	case tea.KeyCtrlO:
-		return append(base, "C-o")
+		tmuxKey = "C-o"
 	case tea.KeyCtrlP:
-		return append(base, "C-p")
+		tmuxKey = "C-p"
 	case tea.KeyCtrlQ:
-		return append(base, "C-q")
+		tmuxKey = "C-q"
 	case tea.KeyCtrlR:
-		return append(base, "C-r")
+		tmuxKey = "C-r"
 	case tea.KeyCtrlS:
-		return append(base, "C-s")
-	// KeyCtrlC is intercepted by the TUI for focus switching
+		tmuxKey = "C-s"
 	case tea.KeyCtrlT:
-		return append(base, "C-t")
+		tmuxKey = "C-t"
 	case tea.KeyCtrlU:
-		return append(base, "C-u")
+		tmuxKey = "C-u"
 	case tea.KeyCtrlV:
-		return append(base, "C-v")
+		tmuxKey = "C-v"
 	case tea.KeyCtrlW:
-		return append(base, "C-w")
+		tmuxKey = "C-w"
 	case tea.KeyCtrlX:
-		return append(base, "C-x")
+		tmuxKey = "C-x"
 	case tea.KeyCtrlY:
-		return append(base, "C-y")
+		tmuxKey = "C-y"
 	case tea.KeyCtrlZ:
-		return append(base, "C-z")
+		tmuxKey = "C-z"
 	}
-	return nil
+
+	if tmuxKey == "" {
+		return nil
+	}
+
+	// For Alt + multi-byte named keys (arrows, function keys, etc.), send
+	// Escape then the key name as separate args. These are multi-byte escape
+	// sequences themselves, so the receiving Bubble Tea instance will buffer
+	// them via detectSequence/canHaveMoreData rather than treating a lone
+	// ESC as standalone.
+	if msg.Alt {
+		return append(base, "Escape", tmuxKey)
+	}
+
+	return append(base, tmuxKey)
+}
+
+// keyByte returns the raw byte for single-byte key types, or 0 if the key
+// type corresponds to a multi-byte escape sequence (arrows, function keys, etc.).
+func keyByte(kt tea.KeyType) byte {
+	switch kt {
+	case tea.KeyEnter:
+		return '\r'
+	case tea.KeyTab:
+		return '\t'
+	case tea.KeyBackspace:
+		return 0x7f
+	case tea.KeyEscape:
+		return 0x1b
+	case tea.KeySpace:
+		return ' '
+	// Ctrl+A through Ctrl+Z are bytes 1-26.
+	case tea.KeyCtrlA:
+		return 1
+	case tea.KeyCtrlB:
+		return 2
+	case tea.KeyCtrlC:
+		return 3
+	case tea.KeyCtrlD:
+		return 4
+	case tea.KeyCtrlE:
+		return 5
+	case tea.KeyCtrlF:
+		return 6
+	case tea.KeyCtrlG:
+		return 7
+	case tea.KeyCtrlH:
+		return 8
+	// KeyCtrlI = Tab (9), handled above
+	case tea.KeyCtrlJ:
+		return 10
+	case tea.KeyCtrlK:
+		return 11
+	case tea.KeyCtrlL:
+		return 12
+	// KeyCtrlM = Enter (13), handled above
+	case tea.KeyCtrlN:
+		return 14
+	case tea.KeyCtrlO:
+		return 15
+	case tea.KeyCtrlP:
+		return 16
+	case tea.KeyCtrlQ:
+		return 17
+	case tea.KeyCtrlR:
+		return 18
+	case tea.KeyCtrlS:
+		return 19
+	case tea.KeyCtrlT:
+		return 20
+	case tea.KeyCtrlU:
+		return 21
+	case tea.KeyCtrlV:
+		return 22
+	case tea.KeyCtrlW:
+		return 23
+	case tea.KeyCtrlX:
+		return 24
+	case tea.KeyCtrlY:
+		return 25
+	case tea.KeyCtrlZ:
+		return 26
+	}
+	return 0
 }
 
 // Render returns the current terminal content as an ANSI string.
