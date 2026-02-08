@@ -417,12 +417,27 @@ func (m *Model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) handleMouseMsg(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	// Dispatch overlay mouse events first
 	if m.overlay != overlayNone {
-		return m, nil
+		return m.handleOverlayMouse(msg)
 	}
 
 	termStartX := sidebarWidth + 1 // sidebar visual width (includes border) + spacer
 
+	// Sidebar mouse events (click or wheel in sidebar area)
+	if msg.X < sidebarWidth {
+		switch {
+		case msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionPress:
+			return m.handleSidebarMouse(msg)
+		case msg.Button == tea.MouseButtonWheelUp:
+			return m.handleSidebarWheelUp()
+		case msg.Button == tea.MouseButtonWheelDown:
+			return m.handleSidebarWheelDown()
+		}
+		return m, nil
+	}
+
+	// Terminal pane mouse events
 	switch {
 	case msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionPress:
 		// Start selection if click is in terminal pane area
@@ -503,7 +518,7 @@ func (m *Model) handleMouseMsg(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case msg.Button == tea.MouseButtonWheelUp:
-		if m.focus != focusTerminal || m.activeSession == nil {
+		if m.activeSession == nil {
 			return m, nil
 		}
 		t, ok := m.terminals[m.activeSession.Name]
@@ -515,7 +530,7 @@ func (m *Model) handleMouseMsg(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case msg.Button == tea.MouseButtonWheelDown:
-		if m.focus != focusTerminal || m.activeSession == nil {
+		if m.activeSession == nil {
 			return m, nil
 		}
 		t, ok := m.terminals[m.activeSession.Name]
@@ -526,6 +541,307 @@ func (m *Model) handleMouseMsg(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		t.ScrollDown(3)
 		return m, nil
 	}
+	return m, nil
+}
+
+// handleSidebarMouse handles left-click events in the sidebar area.
+func (m *Model) handleSidebarMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	m.hasSelection = false
+	m.selecting = false
+	m.focus = focusSidebar
+
+	kind, idx := m.sidebarHitTest(msg.Y)
+	switch kind {
+	case "session":
+		m.cursor = idx
+		m.adjustScroll()
+		return m, m.switchViewToCurrentSession()
+	case "archived":
+		return m.openArchivedOverlay()
+	case "scroll_up":
+		if m.scrollOffset > 0 {
+			m.scrollOffset--
+			// Keep cursor in visible range
+			if m.cursor >= m.scrollOffset+m.maxVisibleSessions() {
+				m.cursor = m.scrollOffset + m.maxVisibleSessions() - 1
+			}
+		}
+		return m, nil
+	case "scroll_down":
+		active := m.activeSessions()
+		maxVisible := m.maxVisibleSessions()
+		maxOffset := len(active) - maxVisible
+		if maxOffset < 0 {
+			maxOffset = 0
+		}
+		if m.scrollOffset < maxOffset {
+			m.scrollOffset++
+			// Keep cursor in visible range
+			if m.cursor < m.scrollOffset {
+				m.cursor = m.scrollOffset
+			}
+		}
+		return m, nil
+	}
+	return m, nil
+}
+
+// handleSidebarWheelUp scrolls the sidebar session list up.
+func (m *Model) handleSidebarWheelUp() (tea.Model, tea.Cmd) {
+	if m.scrollOffset > 0 {
+		m.scrollOffset--
+		// Keep cursor in visible range
+		maxVisible := m.maxVisibleSessions()
+		if m.cursor >= m.scrollOffset+maxVisible {
+			m.cursor = m.scrollOffset + maxVisible - 1
+		}
+	}
+	return m, nil
+}
+
+// handleSidebarWheelDown scrolls the sidebar session list down.
+func (m *Model) handleSidebarWheelDown() (tea.Model, tea.Cmd) {
+	active := m.activeSessions()
+	maxVisible := m.maxVisibleSessions()
+	maxOffset := len(active) - maxVisible
+	if maxOffset < 0 {
+		maxOffset = 0
+	}
+	if m.scrollOffset < maxOffset {
+		m.scrollOffset++
+		// Keep cursor in visible range
+		if m.cursor < m.scrollOffset {
+			m.cursor = m.scrollOffset
+		}
+	}
+	return m, nil
+}
+
+// handleOverlayMouse handles mouse events when an overlay is active.
+func (m *Model) handleOverlayMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	inside := m.isInsideOverlay(msg.X, msg.Y)
+
+	switch {
+	case msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionPress:
+		if !inside {
+			// Click outside overlay dismisses it
+			return m.dismissOverlay()
+		}
+		// Click inside specific overlays
+		switch m.overlay {
+		case overlayHelp:
+			// Any click inside help dismisses it
+			m.overlay = overlayNone
+			return m, nil
+		case overlaySelectBaseBranch, overlaySelectExistingBranch:
+			return m.handleBranchOverlayClick(msg)
+		case overlayArchivedSessions:
+			return m.handleArchivedOverlayClick(msg)
+		}
+		return m, nil
+
+	case msg.Button == tea.MouseButtonWheelUp:
+		if !inside {
+			return m, nil
+		}
+		switch m.overlay {
+		case overlaySelectBaseBranch, overlaySelectExistingBranch:
+			if m.branchCursor > 0 {
+				m.branchCursor--
+			}
+		case overlayArchivedSessions:
+			if m.archivedCursor > 0 {
+				m.archivedCursor--
+				if m.archivedCursor < m.archivedScrollOffset {
+					m.archivedScrollOffset = m.archivedCursor
+				}
+			}
+		}
+		return m, nil
+
+	case msg.Button == tea.MouseButtonWheelDown:
+		if !inside {
+			return m, nil
+		}
+		switch m.overlay {
+		case overlaySelectBaseBranch:
+			showHead := m.showHeadOption()
+			totalItems := len(m.filteredBranches)
+			if showHead {
+				totalItems++
+			}
+			if m.branchCursor < totalItems-1 {
+				m.branchCursor++
+			}
+		case overlaySelectExistingBranch:
+			if m.branchCursor < len(m.filteredBranches)-1 {
+				m.branchCursor++
+			}
+		case overlayArchivedSessions:
+			if m.archivedCursor < len(m.archivedList)-1 {
+				m.archivedCursor++
+				maxVisible := 10
+				if m.archivedCursor >= m.archivedScrollOffset+maxVisible {
+					m.archivedScrollOffset = m.archivedCursor - maxVisible + 1
+				}
+			}
+		}
+		return m, nil
+	}
+	return m, nil
+}
+
+// handleBranchOverlayClick handles clicks inside branch selection overlays.
+func (m *Model) handleBranchOverlayClick(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	startRow, _, _, _ := m.overlayBounds()
+
+	// The overlay content structure for branch selection:
+	// dialogBoxStyle adds 1 line top border + 1 line padding = 2 lines before content
+	// Then: title line, subtitle (base branch only), blank line, input line, blank line
+	// Then the list items start
+	contentStart := startRow + 2 // border + padding
+
+	var listStart int
+	switch m.overlay {
+	case overlaySelectBaseBranch:
+		// title + subtitle + blank + input + blank = 5 lines
+		listStart = contentStart + 5
+	case overlaySelectExistingBranch:
+		// title + blank + input + blank = 4 lines
+		listStart = contentStart + 4
+	default:
+		return m, nil
+	}
+
+	clickedIdx := msg.Y - listStart
+	if clickedIdx < 0 {
+		return m, nil
+	}
+
+	// Account for "↑ N more" indicator shifting items down
+	if m.overlay == overlaySelectBaseBranch {
+		// No scroll indicators in base branch (it uses startIdx logic in view)
+		// The view handles scroll internally; just map to branchCursor directly
+		showHead := m.showHeadOption()
+		totalItems := len(m.filteredBranches)
+		if showHead {
+			totalItems++
+		}
+
+		// Compute what's visible: HEAD option, then startIdx..endIdx branches
+		cursorOffset := 0
+		if showHead {
+			cursorOffset = 1
+		}
+		branchIdx := m.branchCursor - cursorOffset
+		maxVisible := 10
+		startIdx := 0
+		if branchIdx >= startIdx+maxVisible {
+			startIdx = branchIdx - maxVisible + 1
+		}
+		if branchIdx < startIdx && branchIdx >= 0 {
+			startIdx = branchIdx
+		}
+
+		lineOffset := 0
+		// HEAD option takes one line if shown
+		if showHead {
+			if clickedIdx == 0 {
+				m.branchCursor = 0
+				return m, nil
+			}
+			lineOffset = 1
+		}
+		// "↑ N more" takes one line
+		if startIdx > 0 {
+			if clickedIdx == lineOffset {
+				// Clicked on "↑ N more", scroll up
+				if m.branchCursor > 0 {
+					m.branchCursor--
+				}
+				return m, nil
+			}
+			lineOffset++
+		}
+		itemIdx := clickedIdx - lineOffset
+		if itemIdx >= 0 && startIdx+itemIdx < len(m.filteredBranches) {
+			m.branchCursor = startIdx + itemIdx + cursorOffset
+			if m.branchCursor >= totalItems {
+				m.branchCursor = totalItems - 1
+			}
+		}
+	} else {
+		// overlaySelectExistingBranch
+		maxVisible := 10
+		startIdx := 0
+		if m.branchCursor >= startIdx+maxVisible {
+			startIdx = m.branchCursor - maxVisible + 1
+		}
+		endIdx := startIdx + maxVisible
+		if endIdx > len(m.filteredBranches) {
+			endIdx = len(m.filteredBranches)
+		}
+
+		lineOffset := 0
+		if startIdx > 0 {
+			if clickedIdx == 0 {
+				if m.branchCursor > 0 {
+					m.branchCursor--
+				}
+				return m, nil
+			}
+			lineOffset = 1
+		}
+		itemIdx := clickedIdx - lineOffset
+		if itemIdx >= 0 && startIdx+itemIdx < endIdx {
+			m.branchCursor = startIdx + itemIdx
+		}
+	}
+
+	return m, nil
+}
+
+// handleArchivedOverlayClick handles clicks inside the archived sessions overlay.
+func (m *Model) handleArchivedOverlayClick(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	if len(m.archivedList) == 0 {
+		return m, nil
+	}
+
+	startRow, _, _, _ := m.overlayBounds()
+	// border + padding + title + blank = 4 lines before list
+	listStart := startRow + 4
+
+	clickedIdx := msg.Y - listStart
+	if clickedIdx < 0 {
+		return m, nil
+	}
+
+	lineOffset := 0
+	if m.archivedScrollOffset > 0 {
+		if clickedIdx == 0 {
+			// Clicked "↑ N more"
+			if m.archivedCursor > 0 {
+				m.archivedCursor--
+				if m.archivedCursor < m.archivedScrollOffset {
+					m.archivedScrollOffset = m.archivedCursor
+				}
+			}
+			return m, nil
+		}
+		lineOffset = 1
+	}
+
+	maxVisible := 10
+	endIdx := m.archivedScrollOffset + maxVisible
+	if endIdx > len(m.archivedList) {
+		endIdx = len(m.archivedList)
+	}
+
+	itemIdx := clickedIdx - lineOffset
+	if itemIdx >= 0 && m.archivedScrollOffset+itemIdx < endIdx {
+		m.archivedCursor = m.archivedScrollOffset + itemIdx
+	}
+
 	return m, nil
 }
 
@@ -702,6 +1018,45 @@ func (m *Model) handleOverlayKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case overlayArchivedSessions:
 		return m.handleArchivedOverlayKeys(msg)
+	}
+	return m, nil
+}
+
+// dismissOverlay mirrors the Esc key behavior for each overlay type.
+func (m *Model) dismissOverlay() (tea.Model, tea.Cmd) {
+	switch m.overlay {
+	case overlayHelp:
+		m.overlay = overlayNone
+	case overlayCreateSession:
+		m.overlay = overlayNone
+		m.err = nil
+	case overlayEnterNewSessionName:
+		m.overlay = overlaySelectExistingBranch
+		m.selectedBranchName = ""
+	case overlaySelectBaseBranch:
+		m.overlay = overlayCreateSession
+		m.createInput.Focus()
+		return m, textinput.Blink
+	case overlaySelectExistingBranch:
+		m.overlay = overlayCreateSession
+		m.createInput.Focus()
+		return m, textinput.Blink
+	case overlayConfirmBranchWithSession:
+		m.overlay = overlaySelectExistingBranch
+		m.selectedBranchName = ""
+	case overlayDeleteConfirm:
+		if m.deleteFromArchived {
+			m.overlay = overlayArchivedSessions
+			m.deleteFromArchived = false
+		} else {
+			m.overlay = overlayNone
+		}
+		m.selectedSession = nil
+	case overlayArchivedSessions:
+		m.overlay = overlayNone
+	case overlayCreating:
+		// Cannot dismiss while creating
+		return m, nil
 	}
 	return m, nil
 }
@@ -1047,6 +1402,67 @@ func (m *Model) maxVisibleSessions() int {
 		return 1
 	}
 	return available // 1 line per session now
+}
+
+// sidebarHitTest maps a mouse Y coordinate to the sidebar element at that position.
+// Returns a kind string and an index (meaningful only for "session").
+func (m *Model) sidebarHitTest(y int) (kind string, index int) {
+	y++ // empirical offset: Bubble Tea mouse Y is 1 above rendered row
+	towerHeight := 8 // lines consumed by the tower + blank + top border
+	if y < towerHeight {
+		return "tower", 0
+	}
+
+	active := m.activeSessions()
+	maxVisible := m.maxVisibleSessions()
+	row := y - towerHeight // row within the bordered sidebar content
+
+	// Account for the border top line (the border is rendered by lipgloss but
+	// we removed the top border, so the first content line is at row 0 inside
+	// the bordered area). Actually, since BorderTop(false) is used, row 0 is
+	// the first content line.
+
+	lineIdx := 0
+
+	// "↑ N more" indicator
+	hasScrollUp := m.scrollOffset > 0
+	if hasScrollUp {
+		if row == lineIdx {
+			return "scroll_up", 0
+		}
+		lineIdx++
+	}
+
+	// Session rows
+	endIdx := m.scrollOffset + maxVisible
+	if endIdx > len(active) {
+		endIdx = len(active)
+	}
+	visibleCount := endIdx - m.scrollOffset
+	if row >= lineIdx && row < lineIdx+visibleCount {
+		sessionIdx := m.scrollOffset + (row - lineIdx)
+		return "session", sessionIdx
+	}
+	lineIdx += visibleCount
+
+	// "↓ N more" indicator
+	hasScrollDown := endIdx < len(active)
+	if hasScrollDown {
+		if row == lineIdx {
+			return "scroll_down", 0
+		}
+		lineIdx++
+	}
+
+	// Archived sessions indicator
+	if m.archivedCount() > 0 {
+		if row == lineIdx {
+			return "archived", 0
+		}
+		lineIdx++
+	}
+
+	return "empty", 0
 }
 
 // terminalPaneDimensions returns the inner width/height for the terminal pane.
@@ -1675,6 +2091,37 @@ func (m *Model) switchViewToCurrentSession() tea.Cmd {
 	}
 	// If cursor is on the archived line, don't change activeSession
 	return nil
+}
+
+// overlayBounds computes the centered position and dimensions of the current overlay.
+func (m *Model) overlayBounds() (startRow, startCol, height, width int) {
+	overlayStr := m.viewOverlay()
+	if overlayStr == "" {
+		return 0, 0, 0, 0
+	}
+	olLines := strings.Split(overlayStr, "\n")
+	height = len(olLines)
+	for _, line := range olLines {
+		w := lipgloss.Width(line)
+		if w > width {
+			width = w
+		}
+	}
+	startRow = (m.windowHeight - height) / 2
+	startCol = (m.windowWidth - width) / 2
+	if startRow < 0 {
+		startRow = 0
+	}
+	if startCol < 0 {
+		startCol = 0
+	}
+	return
+}
+
+// isInsideOverlay returns true if the given screen coordinates fall within the overlay bounds.
+func (m *Model) isInsideOverlay(x, y int) bool {
+	startRow, startCol, height, width := m.overlayBounds()
+	return x >= startCol && x < startCol+width && y >= startRow && y < startRow+height
 }
 
 // renderOverlayOnTop centers the overlay on top of the background
