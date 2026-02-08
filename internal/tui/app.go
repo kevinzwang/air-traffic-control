@@ -1532,7 +1532,7 @@ func (m *Model) viewSidebar() string {
 	tower.WriteString("  " + towerStyle.Render("\\         /") + pad + helpItem("n", " new session") + "\n")
 	tower.WriteString("  " + towerStyle.Render(" \\  ") + atcStyle.Render("ATC") + towerStyle.Render("  /") + pad + " " + helpItem("a", " archive") + "\n")
 	tower.WriteString("  " + towerStyle.Render("  \\  _  /") + pad + "  " + helpItem("?", " help") + "\n")
-	tower.WriteString("  " + towerStyle.Render("   |   |") + pad + "   " + versionStyle.Render("v"+Version) + "\n")
+	tower.WriteString("  " + towerStyle.Render("   |   |") + pad + "   " + versionStyle.Render(Version) + "\n")
 	tower.WriteString("\n")
 
 	// Top border with embedded repo name
