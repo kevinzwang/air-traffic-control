@@ -338,6 +338,8 @@ func (m *Model) activateSession(sess *session.Session, switchFocus bool) tea.Cmd
 	return func() tea.Msg {
 		m.activeSession = sess
 		if switchFocus {
+			m.message = ""
+			m.err = nil
 			m.focus = focusTerminal
 		}
 
@@ -451,6 +453,8 @@ func (m *Model) handleMouseMsg(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			m.hasSelection = false
 			// Click on terminal switches focus
 			if m.focus == focusSidebar {
+				m.message = ""
+				m.err = nil
 				m.focus = focusTerminal
 			}
 		} else {
@@ -860,6 +864,8 @@ func (m *Model) handleSidebarKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "esc":
 		if m.activeSession != nil {
+			m.message = ""
+			m.err = nil
 			m.focus = focusTerminal
 			return m, nil
 		}
