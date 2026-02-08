@@ -442,12 +442,7 @@ func (m *Model) handleMouseMsg(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	case msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionPress:
 		// Start selection if click is in terminal pane area
 		if msg.X >= termStartX && m.activeSession != nil {
-			col := msg.X - termStartX
-			tw, _ := m.terminalPaneDimensions()
-			if col >= tw {
-				col = tw - 1
-			}
-			row := msg.Y + 1 // empirical offset: Bubble Tea mouse Y is 1 above rendered row
+			col, row := m.mouseToTermCoords(msg.X, msg.Y, termStartX)
 			m.selecting = true
 			m.selStartCol = col
 			m.selStartRow = row
@@ -466,21 +461,7 @@ func (m *Model) handleMouseMsg(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 
 	case msg.Action == tea.MouseActionMotion:
 		if m.selecting {
-			col := msg.X - termStartX
-			if col < 0 {
-				col = 0
-			}
-			tw, th := m.terminalPaneDimensions()
-			if col >= tw {
-				col = tw - 1
-			}
-			row := msg.Y + 1
-			if row < 0 {
-				row = 0
-			}
-			if row >= th {
-				row = th - 1
-			}
+			col, row := m.mouseToTermCoords(msg.X, msg.Y, termStartX)
 			m.selEndCol = col
 			m.selEndRow = row
 			m.hasSelection = true
@@ -490,21 +471,7 @@ func (m *Model) handleMouseMsg(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	case msg.Action == tea.MouseActionRelease:
 		if m.selecting {
 			m.selecting = false
-			col := msg.X - termStartX
-			if col < 0 {
-				col = 0
-			}
-			tw, th := m.terminalPaneDimensions()
-			if col >= tw {
-				col = tw - 1
-			}
-			row := msg.Y + 1
-			if row < 0 {
-				row = 0
-			}
-			if row >= th {
-				row = th - 1
-			}
+			col, row := m.mouseToTermCoords(msg.X, msg.Y, termStartX)
 			m.selEndCol = col
 			m.selEndRow = row
 			// Only finalize selection if the mouse actually moved
@@ -1477,6 +1444,27 @@ func (m *Model) terminalPaneDimensions() (int, int) {
 		termHeight = 5
 	}
 	return termWidth, termHeight
+}
+
+// mouseToTermCoords converts raw mouse coordinates to clamped terminal pane
+// coordinates, applying empirical offsets for Bubble Tea's coordinate reporting.
+func (m *Model) mouseToTermCoords(mouseX, mouseY, termStartX int) (col, row int) {
+	tw, th := m.terminalPaneDimensions()
+	col = mouseX - termStartX - 1 // Bubble Tea mouse X is 1 to the right
+	if col < 0 {
+		col = 0
+	}
+	if col >= tw {
+		col = tw - 1
+	}
+	row = mouseY + 1 // Bubble Tea mouse Y is 1 above rendered row
+	if row < 0 {
+		row = 0
+	}
+	if row >= th {
+		row = th - 1
+	}
+	return col, row
 }
 
 // --- View ---
