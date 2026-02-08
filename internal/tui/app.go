@@ -1694,7 +1694,7 @@ func (m *Model) viewTerminal() string {
 
 			// Dim terminal content when sidebar is focused
 			if m.focus == focusSidebar {
-				rendered = lipgloss.NewStyle().Foreground(textDim).Render(stripANSI(rendered))
+				rendered = dimANSIColors(rendered, 0.4)
 			}
 
 			return rendered
