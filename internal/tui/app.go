@@ -1316,7 +1316,7 @@ func (m *Model) showHeadOption() bool {
 
 func (m *Model) getSelectedBaseBranch(showHead bool) string {
 	if showHead && m.branchCursor == 0 {
-		return "HEAD"
+		return m.currentBranch
 	}
 	branchIdx := m.branchCursor
 	if showHead {
