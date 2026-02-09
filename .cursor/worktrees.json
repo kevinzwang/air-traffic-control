@@ -1,0 +1,5 @@
+{
+  "setup-worktree": [
+    "sleep 10"
+  ]
+}
