@@ -2390,10 +2390,13 @@ func (m *Model) normalizedSelection() (startRow, startCol, endRow, endCol int) {
 	return
 }
 
-// applySelectionHighlight overlays reverse video on the selected text region.
+const selectionLightenFactor = 0.35
+
+// applySelectionHighlight overlays a lightened highlight on the selected text region.
 func (m *Model) applySelectionHighlight(content string) string {
 	lines := strings.Split(content, "\n")
 	startRow, startCol, endRow, endCol := m.normalizedSelection()
+	termWidth, _ := m.terminalPaneDimensions()
 
 	for i := startRow; i <= endRow && i < len(lines); i++ {
 		if i < 0 {
@@ -2408,57 +2411,17 @@ func (m *Model) applySelectionHighlight(content string) string {
 		if i == endRow {
 			lec = endCol
 		} else {
-			// Full line — select to the end
-			stripped := stripANSI(lines[i])
-			lec = utf8.RuneCountInString(stripped) - 1
+			// Non-last line — extend highlight to full terminal width.
+			lec = termWidth - 1
 		}
 		if lec < lsc {
 			continue
 		}
 
-		lines[i] = applyReverseVideoToLine(lines[i], lsc, lec)
+		lines[i] = applyHighlightToLine(lines[i], lsc, lec, selectionLightenFactor)
 	}
 
 	return strings.Join(lines, "\n")
-}
-
-// applyReverseVideoToLine inserts ANSI reverse video escape codes around
-// visible columns [startCol, endCol] (inclusive) in a line that may contain ANSI escapes.
-func applyReverseVideoToLine(line string, startCol, endCol int) string {
-	var result strings.Builder
-	visCol := 0
-	inReverse := false
-	i := 0
-
-	for i < len(line) {
-		if line[i] == '\x1b' && i+1 < len(line) {
-			j := ansiEscapeEnd(line, i)
-			result.WriteString(line[i:j])
-			i = j
-			continue
-		}
-
-		if !inReverse && visCol >= startCol && visCol <= endCol {
-			result.WriteString("\x1b[7m")
-			inReverse = true
-		}
-
-		r, size := utf8.DecodeRuneInString(line[i:])
-		result.WriteRune(r)
-		i += size
-		visCol++
-
-		if inReverse && visCol > endCol {
-			result.WriteString("\x1b[27m")
-			inReverse = false
-		}
-	}
-
-	if inReverse {
-		result.WriteString("\x1b[27m")
-	}
-
-	return result.String()
 }
 
 // getSelectedText returns the plain text of the current selection.
