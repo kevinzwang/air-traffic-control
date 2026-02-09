@@ -2,7 +2,6 @@ package session
 
 import (
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"time"
@@ -49,26 +48,28 @@ func (s *Service) RepoPath() string {
 	return s.repoPath
 }
 
-// CreateSession creates a new session with worktree and setup commands
-// baseBranch specifies the base for new branches (empty string defaults to HEAD)
-// useExistingBranch when true will attach to an existing branch instead of creating a new one
-func (s *Service) CreateSession(name, baseBranch string, useExistingBranch bool, output io.Writer) (*Session, error) {
+// CreateSession creates a new session with a git worktree and saves it to the DB.
+// It returns the session and any setup commands from the config (which the caller
+// should run in the background). baseBranch specifies the base for new branches
+// (empty string defaults to HEAD). useExistingBranch when true will attach to an
+// existing branch instead of creating a new one.
+func (s *Service) CreateSession(name, baseBranch string, useExistingBranch bool) (*Session, []string, error) {
 	if err := worktree.ValidateBranchName(name); err != nil {
-		return nil, fmt.Errorf("invalid session name: %w", err)
+		return nil, nil, fmt.Errorf("invalid session name: %w", err)
 	}
 
 	existing, _ := s.db.GetSessionByName(name)
 	if existing != nil {
-		return nil, fmt.Errorf("session with name '%s' already exists", name)
+		return nil, nil, fmt.Errorf("session with name '%s' already exists", name)
 	}
 
 	if useExistingBranch {
 		existingByBranch, err := s.db.GetSessionByBranchName(name)
 		if err != nil {
-			return nil, fmt.Errorf("failed to check branch: %w", err)
+			return nil, nil, fmt.Errorf("failed to check branch: %w", err)
 		}
 		if existingByBranch != nil {
-			return nil, fmt.Errorf("branch '%s' already has a session", name)
+			return nil, nil, fmt.Errorf("branch '%s' already has a session", name)
 		}
 	}
 
@@ -83,36 +84,25 @@ func (s *Service) CreateSession(name, baseBranch string, useExistingBranch bool,
 		Status:       "active",
 	}
 
-	fmt.Fprintf(output, "Creating git worktree...\n")
 	if err := worktree.CreateWorktree(s.repoPath, name, sess.BranchName, sess.WorktreePath, baseBranch, useExistingBranch); err != nil {
-		return nil, fmt.Errorf("failed to create worktree: %w", err)
+		return nil, nil, fmt.Errorf("failed to create worktree: %w", err)
 	}
 
 	// cleanupWorktree ensures worktree is removed on any subsequent error
 	cleanupWorktree := func() { worktree.DeleteWorktree(sess.WorktreePath) }
 
-	cfg, err := config.Load(s.repoPath)
+	cfg, err := config.Load(sess.WorktreePath)
 	if err != nil {
 		cleanupWorktree()
-		return nil, fmt.Errorf("failed to load config: %w", err)
-	}
-
-	fmt.Fprintf(output, "Worktree created\n")
-	if len(cfg.SetupWorktree) > 0 {
-		fmt.Fprintf(output, "Running setup commands...\n")
-		if err := worktree.RunSetupCommands(sess.WorktreePath, cfg.SetupWorktree, output); err != nil {
-			cleanupWorktree()
-			return nil, fmt.Errorf("setup commands failed: %w", err)
-		}
-		fmt.Fprintf(output, "Setup complete\n")
+		return nil, nil, fmt.Errorf("failed to load config: %w", err)
 	}
 
 	if err := s.db.InsertSession(sess.toDBSession()); err != nil {
 		cleanupWorktree()
-		return nil, fmt.Errorf("failed to save session: %w", err)
+		return nil, nil, fmt.Errorf("failed to save session: %w", err)
 	}
 
-	return sess, nil
+	return sess, cfg.SetupWorktree, nil
 }
 
 // ListSessions returns all sessions, optionally filtered by query

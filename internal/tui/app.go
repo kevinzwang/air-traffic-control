@@ -54,7 +54,13 @@ type sessionsLoadedMsg struct {
 }
 
 type sessionCreatedMsg struct {
-	session *session.Session
+	session       *session.Session
+	setupCommands []string
+}
+
+type setupCompleteMsg struct {
+	sessionName string
+	err         error
 }
 
 type sessionDeletedMsg struct {
@@ -105,9 +111,10 @@ type Model struct {
 	deleteFromArchived   bool
 
 	// Spinner for creating state
-	spinner spinner.Model
-	err     error
-	message string
+	spinner            spinner.Model
+	err                error
+	message            string
+	settingUpSessions  map[string]bool
 
 	// Session creation fields
 	createInput        textinput.Model
@@ -147,14 +154,15 @@ func NewModel(service *session.Service, repoName string, invokingBranch string) 
 	tmuxSocket := fmt.Sprintf("atc-%x", hash[:4])
 
 	return &Model{
-		focus:         focusSidebar,
-		overlay:       overlayNone,
-		service:       service,
-		repoName:      repoName,
-		spinner:       s,
-		currentBranch: invokingBranch,
-		terminals:     make(map[string]*terminal.Terminal),
-		tmuxSocket:    tmuxSocket,
+		focus:             focusSidebar,
+		overlay:           overlayNone,
+		service:           service,
+		repoName:          repoName,
+		spinner:           s,
+		currentBranch:     invokingBranch,
+		terminals:         make(map[string]*terminal.Terminal),
+		tmuxSocket:        tmuxSocket,
+		settingUpSessions: make(map[string]bool),
 	}
 }
 
@@ -282,7 +290,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.pendingSessionName = ""
 		m.selectAfterLoad = msg.session.Name
 		m.activatingSession = msg.session.Name
-		return m, tea.Batch(m.loadSessions(), m.activateSession(msg.session, true))
+		cmds := []tea.Cmd{m.loadSessions(), m.activateSession(msg.session, true)}
+		if len(msg.setupCommands) > 0 {
+			m.settingUpSessions[msg.session.Name] = true
+			cmds = append(cmds, m.runSetupInBackground(msg.session.Name, msg.session.WorktreePath, msg.setupCommands))
+		}
+		return m, tea.Batch(cmds...)
 
 	case sessionDeletedMsg:
 		m.message = fmt.Sprintf("Session '%s' deleted", msg.name)
@@ -309,6 +322,18 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case sessionUnarchivedMsg:
 		m.message = fmt.Sprintf("Session '%s' unarchived", msg.name)
 		return m, m.loadSessions()
+
+	case setupCompleteMsg:
+		if !m.settingUpSessions[msg.sessionName] {
+			return m, nil
+		}
+		delete(m.settingUpSessions, msg.sessionName)
+		if msg.err != nil {
+			m.err = fmt.Errorf("setup failed for '%s': %w", msg.sessionName, msg.err)
+		} else {
+			m.message = fmt.Sprintf("Setup complete for '%s'", msg.sessionName)
+		}
+		return m, nil
 
 	case errMsg:
 		m.err = msg.err
@@ -1226,6 +1251,7 @@ func (m *Model) handleDeleteConfirmKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "y", "Y":
 		name := m.selectedSession.Name
+		delete(m.settingUpSessions, name)
 		// Close terminal if running
 		if t, ok := m.terminals[name]; ok {
 			t.Close()
@@ -1268,12 +1294,19 @@ func (m *Model) doCreateSession(baseBranch string, useExisting bool) tea.Cmd {
 	m.overlay = overlayCreating
 
 	return func() tea.Msg {
-		var buf bytes.Buffer
-		sess, err := m.service.CreateSession(name, baseBranch, useExisting, &buf)
+		sess, setupCmds, err := m.service.CreateSession(name, baseBranch, useExisting)
 		if err != nil {
 			return errMsg{err}
 		}
-		return sessionCreatedMsg{session: sess}
+		return sessionCreatedMsg{session: sess, setupCommands: setupCmds}
+	}
+}
+
+func (m *Model) runSetupInBackground(sessionName, worktreePath string, commands []string) tea.Cmd {
+	return func() tea.Msg {
+		var buf bytes.Buffer
+		err := worktree.RunSetupCommands(worktreePath, commands, &buf)
+		return setupCompleteMsg{sessionName: sessionName, err: err}
 	}
 }
 
@@ -1644,7 +1677,13 @@ func (m *Model) viewSidebar() string {
 
 func (m *Model) renderSidebarSession(b *strings.Builder, s *session.Session, idx int, maxWidth int) {
 	isSelected := m.cursor == idx
-	name := truncate(s.Name, maxWidth-2)
+	isSettingUp := m.settingUpSessions[s.Name]
+
+	prefix := " "
+	if isSettingUp {
+		prefix = " " + m.spinner.View() + " "
+	}
+	name := truncate(s.Name, maxWidth-lipgloss.Width(prefix)-1)
 
 	var style lipgloss.Style
 	if m.focus == focusSidebar {
@@ -1660,7 +1699,7 @@ func (m *Model) renderSidebarSession(b *strings.Builder, s *session.Session, idx
 			style = sidebarSessionDimStyle
 		}
 	}
-	b.WriteString(style.Render(" "+name) + "\n")
+	b.WriteString(style.Render(prefix+name) + "\n")
 }
 
 func (m *Model) viewTerminal() string {
