@@ -1,6 +1,0 @@
-{
-  "setup-worktree": [
-    "sleep 10",
-    "touch completed"
-  ]
-}
