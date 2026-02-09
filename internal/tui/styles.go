@@ -6,7 +6,8 @@ import (
 
 // Layout constants
 const (
-	sidebarWidth = 36
+	sidebarWidth         = 36
+	smallScreenThreshold = 100
 )
 
 var (

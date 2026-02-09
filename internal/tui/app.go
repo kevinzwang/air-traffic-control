@@ -409,6 +409,7 @@ func (m *Model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Ctrl+C from terminal switches back to sidebar
 	if msg.String() == "ctrl+c" && m.focus == focusTerminal {
 		m.focus = focusSidebar
+		m.resizeTerminalIfNeeded()
 		return m, nil
 	}
 
@@ -424,10 +425,15 @@ func (m *Model) handleMouseMsg(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		return m.handleOverlayMouse(msg)
 	}
 
-	termStartX := sidebarWidth + 1 // sidebar visual width (includes border) + spacer
+	var termStartX int
+	if m.sidebarVisible() {
+		termStartX = sidebarWidth + 1 // sidebar visual width (includes border) + spacer
+	} else {
+		termStartX = 0
+	}
 
 	// Sidebar mouse events (click or wheel in sidebar area)
-	if msg.X < sidebarWidth {
+	if m.sidebarVisible() && msg.X < sidebarWidth {
 		switch {
 		case msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionPress:
 			return m.handleSidebarMouse(msg)
@@ -456,6 +462,7 @@ func (m *Model) handleMouseMsg(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 				m.message = ""
 				m.err = nil
 				m.focus = focusTerminal
+				m.resizeTerminalIfNeeded()
 			}
 		} else {
 			m.hasSelection = false
@@ -520,6 +527,7 @@ func (m *Model) handleSidebarMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	m.hasSelection = false
 	m.selecting = false
 	m.focus = focusSidebar
+	m.resizeTerminalIfNeeded()
 
 	kind, idx := m.sidebarHitTest(msg.Y)
 	switch kind {
@@ -867,6 +875,7 @@ func (m *Model) handleSidebarKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.message = ""
 			m.err = nil
 			m.focus = focusTerminal
+			m.resizeTerminalIfNeeded()
 			return m, nil
 		}
 		return m, nil
@@ -1438,10 +1447,34 @@ func (m *Model) sidebarHitTest(y int) (kind string, index int) {
 	return "empty", 0
 }
 
+// sidebarVisible returns whether the sidebar should be rendered.
+// On narrow screens (< smallScreenThreshold), the sidebar is only shown when focused.
+func (m *Model) sidebarVisible() bool {
+	if m.windowWidth >= smallScreenThreshold {
+		return true
+	}
+	return m.focus == focusSidebar
+}
+
+// resizeTerminalIfNeeded resizes the active terminal to match current pane dimensions.
+func (m *Model) resizeTerminalIfNeeded() {
+	if m.activeSession != nil {
+		if t, ok := m.terminals[m.activeSession.Name]; ok {
+			tw, th := m.terminalPaneDimensions()
+			t.Resize(tw, th)
+		}
+	}
+}
+
 // terminalPaneDimensions returns the inner width/height for the terminal pane.
 func (m *Model) terminalPaneDimensions() (int, int) {
-	// sidebarWidth already includes border chars, plus 1 for spacer
-	termWidth := m.windowWidth - sidebarWidth - 1
+	var termWidth int
+	if m.sidebarVisible() {
+		// sidebarWidth already includes border chars, plus 1 for spacer
+		termWidth = m.windowWidth - sidebarWidth - 1
+	} else {
+		termWidth = m.windowWidth
+	}
 	if termWidth < 10 {
 		termWidth = 10
 	}
@@ -1480,10 +1513,16 @@ func (m *Model) View() string {
 		return "Loading..."
 	}
 
-	sidebar := m.viewSidebar()
-	termPane := m.viewTerminal()
-
-	layout := lipgloss.JoinHorizontal(lipgloss.Top, sidebar, " ", termPane)
+	var layout string
+	if !m.sidebarVisible() {
+		// Narrow screen + terminal focused: terminal only
+		layout = m.viewTerminal()
+	} else {
+		// Sidebar visible: both panes side by side
+		sidebar := m.viewSidebar()
+		termPane := m.viewTerminal()
+		layout = lipgloss.JoinHorizontal(lipgloss.Top, sidebar, " ", termPane)
+	}
 
 	// Render overlay on top if active
 	if m.overlay != overlayNone {
