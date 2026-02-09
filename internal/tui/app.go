@@ -3,10 +3,10 @@ package tui
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/base64"
 	"fmt"
-	"os/exec"
+	"os"
 	"regexp"
-	"runtime"
 	"strings"
 	"unicode/utf8"
 
@@ -2516,15 +2516,9 @@ func (m *Model) copySelectionToClipboard() {
 	if text == "" {
 		return
 	}
-	var cmd *exec.Cmd
-	switch runtime.GOOS {
-	case "darwin":
-		cmd = exec.Command("pbcopy")
-	case "linux":
-		cmd = exec.Command("xclip", "-selection", "clipboard")
-	default:
-		return
-	}
-	cmd.Stdin = strings.NewReader(text)
-	cmd.Run()
+	// Use OSC 52 escape sequence to set the system clipboard.
+	// This works over SSH because the escape sequence is interpreted
+	// by the local terminal emulator, not the remote host.
+	encoded := base64.StdEncoding.EncodeToString([]byte(text))
+	fmt.Fprintf(os.Stderr, "\x1b]52;c;%s\x07", encoded)
 }
