@@ -58,13 +58,13 @@ func (s *Service) CreateSession(name, baseBranch string, useExistingBranch bool)
 		return nil, nil, fmt.Errorf("invalid session name: %w", err)
 	}
 
-	existing, _ := s.db.GetSessionByName(name)
+	existing, _ := s.db.GetSessionByName(name, s.repoPath)
 	if existing != nil {
 		return nil, nil, fmt.Errorf("session with name '%s' already exists", name)
 	}
 
 	if useExistingBranch {
-		existingByBranch, err := s.db.GetSessionByBranchName(name)
+		existingByBranch, err := s.db.GetSessionByBranchName(name, s.repoPath)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to check branch: %w", err)
 		}
@@ -121,7 +121,7 @@ func (s *Service) ListSessions(query string) ([]*Session, error) {
 
 // GetSession retrieves a session by name
 func (s *Service) GetSession(name string) (*Session, error) {
-	dbs, err := s.db.GetSessionByName(name)
+	dbs, err := s.db.GetSessionByName(name, s.repoPath)
 	if err != nil {
 		return nil, err
 	}
@@ -176,7 +176,7 @@ func (s *Service) ListBranches() ([]string, error) {
 
 // GetSessionByBranch returns a session for a given branch name, or nil if none exists
 func (s *Service) GetSessionByBranch(branchName string) (*Session, error) {
-	dbs, err := s.db.GetSessionByBranchName(branchName)
+	dbs, err := s.db.GetSessionByBranchName(branchName, s.repoPath)
 	if err != nil {
 		return nil, err
 	}

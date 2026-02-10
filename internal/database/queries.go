@@ -41,17 +41,17 @@ func (db *DB) InsertSession(s *Session) error {
 	return nil
 }
 
-// GetSessionByName retrieves a session by its name
-func (db *DB) GetSessionByName(name string) (*Session, error) {
+// GetSessionByName retrieves a session by its name within a specific repo
+func (db *DB) GetSessionByName(name string, repoPath string) (*Session, error) {
 	query := `
 		SELECT id, name, repo_path, repo_name, worktree_path, branch_name,
 		       created_at, last_accessed, archived_at, status
 		FROM sessions
-		WHERE name = ?
+		WHERE name = ? AND repo_path = ?
 	`
 
 	var s Session
-	err := db.conn.QueryRow(query, name).Scan(
+	err := db.conn.QueryRow(query, name, repoPath).Scan(
 		&s.ID, &s.Name, &s.RepoPath, &s.RepoName, &s.WorktreePath, &s.BranchName,
 		&s.CreatedAt, &s.LastAccessed, &s.ArchivedAt, &s.Status,
 	)
@@ -64,17 +64,17 @@ func (db *DB) GetSessionByName(name string) (*Session, error) {
 	return &s, nil
 }
 
-// GetSessionByBranchName retrieves a session by its branch name
-func (db *DB) GetSessionByBranchName(branchName string) (*Session, error) {
+// GetSessionByBranchName retrieves a session by its branch name within a specific repo
+func (db *DB) GetSessionByBranchName(branchName string, repoPath string) (*Session, error) {
 	query := `
 		SELECT id, name, repo_path, repo_name, worktree_path, branch_name,
 		       created_at, last_accessed, archived_at, status
 		FROM sessions
-		WHERE branch_name = ?
+		WHERE branch_name = ? AND repo_path = ?
 	`
 
 	var s Session
-	err := db.conn.QueryRow(query, branchName).Scan(
+	err := db.conn.QueryRow(query, branchName, repoPath).Scan(
 		&s.ID, &s.Name, &s.RepoPath, &s.RepoName, &s.WorktreePath, &s.BranchName,
 		&s.CreatedAt, &s.LastAccessed, &s.ArchivedAt, &s.Status,
 	)
