@@ -15,7 +15,7 @@ func TestDimANSIColors_EmptyString(t *testing.T) {
 func TestDimANSIColors_PlainText(t *testing.T) {
 	result := dimANSIColors("hello world", 0.4)
 	// Should prepend dim default foreground then the text.
-	if !strings.HasPrefix(result, "\x1b[38;2;91;100;109m") {
+	if !strings.HasPrefix(result, "\x1b[38;2;137;150;163m") {
 		t.Errorf("expected dim default prefix, got %q", result)
 	}
 	if !strings.HasSuffix(result, "hello world") {
@@ -103,7 +103,7 @@ func TestDimANSIColors_Reset(t *testing.T) {
 	input := "\x1b[31mred\x1b[0mnormal"
 	result := dimANSIColors(input, 0.4)
 	// After reset, should see re-applied dim default.
-	if !strings.Contains(result, "\x1b[0;38;2;91;100;109m") {
+	if !strings.Contains(result, "\x1b[0;38;2;137;150;163m") {
 		t.Errorf("expected reset + dim default, got %q", result)
 	}
 }
@@ -112,7 +112,7 @@ func TestDimANSIColors_DefaultForeground(t *testing.T) {
 	// ESC[39m (default fg) → replaced with dim default.
 	input := "\x1b[39mdefault"
 	result := dimANSIColors(input, 0.4)
-	if !strings.Contains(result, "\x1b[38;2;91;100;109m") {
+	if !strings.Contains(result, "\x1b[38;2;137;150;163m") {
 		t.Errorf("expected default fg replaced with dim, got %q", result)
 	}
 }
@@ -144,7 +144,7 @@ func TestDimANSIColors_MixedContent(t *testing.T) {
 		t.Errorf("expected dimmed color in mixed content, got %q", result)
 	}
 	// Should contain reset + dim default.
-	if !strings.Contains(result, "\x1b[0;38;2;91;100;109m") {
+	if !strings.Contains(result, "\x1b[0;38;2;137;150;163m") {
 		t.Errorf("expected reset + dim default in mixed content, got %q", result)
 	}
 	// Should contain bold passed through.
@@ -167,7 +167,7 @@ func TestDimANSIColors_EmptyResetSequence(t *testing.T) {
 	// ESC[m is equivalent to ESC[0m.
 	input := "\x1b[mtext"
 	result := dimANSIColors(input, 0.4)
-	if !strings.Contains(result, "\x1b[0;38;2;91;100;109m") {
+	if !strings.Contains(result, "\x1b[0;38;2;137;150;163m") {
 		t.Errorf("expected empty reset treated as reset, got %q", result)
 	}
 }
@@ -218,7 +218,7 @@ func TestDimANSIColors_NewlineReappliesDimDefault(t *testing.T) {
 	// doesn't leave lines inheriting the sidebar's reset state.
 	input := "line1\nline2"
 	result := dimANSIColors(input, 0.4)
-	dimDefault := "\x1b[38;2;91;100;109m"
+	dimDefault := "\x1b[38;2;137;150;163m"
 	expected := dimDefault + "line1\n" + dimDefault + "line2"
 	if result != expected {
 		t.Errorf("expected dim default after newline\ngot:  %q\nwant: %q", result, expected)
