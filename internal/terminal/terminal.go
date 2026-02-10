@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -369,13 +370,13 @@ func (t *Terminal) keyMsgToTmuxArgs(msg tea.KeyMsg) []string {
 		return nil
 	}
 
-	// For Alt + multi-byte named keys (arrows, function keys, etc.), send
-	// ESC + the raw escape sequence as a single literal via -l so both
-	// arrive in one PTY write. Sending them as separate tmux args causes
-	// two writes, making the shell see a standalone Escape + a plain key.
+	// For Alt + multi-byte named keys (arrows, function keys, etc.),
+	// compute the proper CSI sequence with the Alt modifier bit and send
+	// it as a literal via -l. The xterm modifier encoding uses parameter
+	// (1 + flags) where Alt = 2, e.g. Alt+Up = \x1b[1;3A.
 	if msg.Alt {
 		if seq := keySequence(msg.Type); seq != "" {
-			return append(base, "-l", "\x1b"+seq)
+			return append(base, "-l", addAltModifier(seq))
 		}
 	}
 
@@ -569,6 +570,60 @@ func keySequence(kt tea.KeyType) string {
 		return "\x1b[34~"
 	}
 	return ""
+}
+
+// addAltModifier takes a raw escape sequence (as returned by keySequence) and
+// returns the same sequence with the Alt modifier bit (value 2) added per the
+// xterm CSI modifier encoding standard. The modifier parameter is (1 + flags),
+// where Alt = 2, so a bare sequence gets ";3" and an existing modifier N
+// becomes N+2 (e.g. Ctrl=5 -> Ctrl+Alt=7).
+//
+// Handles three CSI formats:
+//   - Letter-final:  \x1b[A -> \x1b[1;3A,  \x1b[1;5A -> \x1b[1;7A
+//   - Tilde-final:   \x1b[3~ -> \x1b[3;3~, \x1b[5;5~ -> \x1b[5;7~
+//   - SS3 (F1-F4):   \x1bOP -> \x1b[1;3P
+func addAltModifier(seq string) string {
+	const altBit = 2
+
+	// SS3 format: \x1bO followed by P/Q/R/S (F1-F4).
+	// Convert to CSI format with modifier: \x1b[1;3P
+	if len(seq) == 3 && seq[0] == '\x1b' && seq[1] == 'O' {
+		return fmt.Sprintf("\x1b[1;%d%c", 1+altBit, seq[2])
+	}
+
+	// Must be CSI format: \x1b[ ... final_byte
+	if len(seq) < 3 || seq[0] != '\x1b' || seq[1] != '[' {
+		// Unknown format — prepend ESC as fallback.
+		return "\x1b" + seq
+	}
+
+	body := seq[2:]           // everything after \x1b[
+	final := body[len(body)-1] // the terminating character (letter or ~)
+	params := body[:len(body)-1]
+
+	if final == '~' {
+		// Tilde-final: \x1b[N~ or \x1b[N;M~
+		if idx := strings.IndexByte(params, ';'); idx >= 0 {
+			// Already has modifier: \x1b[N;M~ -> add altBit to M.
+			existing, _ := strconv.Atoi(params[idx+1:])
+			return fmt.Sprintf("\x1b[%s;%d~", params[:idx], existing+altBit)
+		}
+		// No modifier: \x1b[N~ -> \x1b[N;3~
+		return fmt.Sprintf("\x1b[%s;%d~", params, 1+altBit)
+	}
+
+	// Letter-final: \x1b[A or \x1b[1;MA
+	if idx := strings.IndexByte(params, ';'); idx >= 0 {
+		// Already has modifier: add altBit.
+		existing, _ := strconv.Atoi(params[idx+1:])
+		return fmt.Sprintf("\x1b[%s;%d%c", params[:idx], existing+altBit, final)
+	}
+	if len(params) == 0 {
+		// Bare: \x1b[A -> \x1b[1;3A
+		return fmt.Sprintf("\x1b[1;%d%c", 1+altBit, final)
+	}
+	// Has parameter but no modifier (shouldn't normally occur): \x1b[1A -> \x1b[1;3A
+	return fmt.Sprintf("\x1b[%s;%d%c", params, 1+altBit, final)
 }
 
 // Render returns the current terminal content as an ANSI string.
