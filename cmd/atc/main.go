@@ -26,30 +26,13 @@ func run() error {
 		return fmt.Errorf("tmux is required but not found in PATH. Install it with: brew install tmux")
 	}
 
-	// Get current directory (should be a git repo)
-	cwd, err := os.Getwd()
-	if err != nil {
-		return fmt.Errorf("failed to get current directory: %w", err)
-	}
-
-	// Check if we're in a git repository
-	if !isGitRepo(cwd) {
-		return fmt.Errorf("not a git repository (or any of the parent directories)")
-	}
-
-	// Get the root of the git repository
-	repoPath, err := getGitRoot(cwd)
-	if err != nil {
-		return fmt.Errorf("failed to get git root: %w", err)
-	}
-
 	// Get home directory for ATC database
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return fmt.Errorf("failed to get home directory: %w", err)
 	}
 
-	// Open database
+	// Open database first (it's global across all repos)
 	dbPath := filepath.Join(homeDir, ".atc", "sessions.db")
 	db, err := database.Open(dbPath)
 	if err != nil {
@@ -57,23 +40,38 @@ func run() error {
 	}
 	defer db.Close()
 
-	// Create session service
-	service, err := session.NewService(db, repoPath)
+	// Get current directory
+	cwd, err := os.Getwd()
 	if err != nil {
-		return fmt.Errorf("failed to create session service: %w", err)
+		return fmt.Errorf("failed to get current directory: %w", err)
 	}
 
-	// Extract repo name for display
-	repoName := filepath.Base(repoPath)
+	var service *session.Service
+	var repoName string
+	var invokingBranch string
 
-	// Get current branch from the invoking directory
-	invokingBranch, err := getCurrentBranch(cwd)
-	if err != nil {
-		invokingBranch = "HEAD"
+	// If we're in a git repository, set up the service
+	if isGitRepo(cwd) {
+		repoPath, err := getGitRoot(cwd)
+		if err != nil {
+			return fmt.Errorf("failed to get git root: %w", err)
+		}
+
+		service, err = session.NewService(db, repoPath)
+		if err != nil {
+			return fmt.Errorf("failed to create session service: %w", err)
+		}
+
+		repoName = filepath.Base(repoPath)
+
+		invokingBranch, err = getCurrentBranch(cwd)
+		if err != nil {
+			invokingBranch = "HEAD"
+		}
 	}
 
-	// Launch TUI
-	model := tui.NewModel(service, repoName, invokingBranch)
+	// Launch TUI (service may be nil if not in a git repo)
+	model := tui.NewModel(db, service, repoName, invokingBranch)
 	p := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	model.SetProgram(p)
 
