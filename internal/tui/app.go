@@ -104,8 +104,9 @@ type projectsLoadedMsg struct {
 }
 
 type projectSwitchedMsg struct {
-	service  *session.Service
-	repoName string
+	service       *session.Service
+	repoName      string
+	currentBranch string
 }
 
 type Model struct {
@@ -301,7 +302,11 @@ func (m *Model) switchProject(project *database.Project) tea.Cmd {
 		if err != nil {
 			return errMsg{err}
 		}
-		return projectSwitchedMsg{service: svc, repoName: project.RepoName}
+		branch, err := worktree.GetCurrentBranch(project.RepoPath)
+		if err != nil {
+			branch = "HEAD"
+		}
+		return projectSwitchedMsg{service: svc, repoName: project.RepoName, currentBranch: branch}
 	}
 }
 
@@ -441,6 +446,25 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.scrollOffset = 0
 		m.noProjectMode = false
 		m.overlay = overlayNone
+		// Reset branch state
+		m.currentBranch = msg.currentBranch
+		m.branches = nil
+		m.filteredBranches = nil
+		m.branchesWithSessions = make(map[string]bool)
+		m.branchCursor = 0
+		m.branchScrollOffset = 0
+		m.selectedBranchName = ""
+		// Reset session creation state
+		m.pendingSessionName = ""
+		m.selectAfterLoad = ""
+		m.activatingSession = ""
+		m.settingUpSessions = make(map[string]bool)
+		// Reset misc state
+		m.selectedSession = nil
+		m.err = nil
+		m.message = ""
+		m.hasSelection = false
+		m.selecting = false
 		return m, m.loadSessions()
 
 	case errMsg:
