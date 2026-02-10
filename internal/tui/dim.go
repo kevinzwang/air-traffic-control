@@ -14,8 +14,8 @@ func dimANSIColors(s string, factor float64) string {
 		return s
 	}
 
-	// Dim default foreground: #495057 = rgb(73,80,87)
-	const dimDefault = "\x1b[38;2;73;80;87m"
+	// Dim default foreground: rgb(137,150,163)
+	const dimDefault = "\x1b[38;2;137;150;163m"
 
 	var out strings.Builder
 	out.Grow(len(s) + 64)
@@ -129,7 +129,7 @@ func dimANSIColors(s string, factor float64) string {
 func transformSGR(params string, factor float64) string {
 	if params == "" {
 		// ESC[m is equivalent to ESC[0m (reset).
-		return "0;38;2;73;80;87"
+		return "0;38;2;137;150;163"
 	}
 
 	parts := strings.Split(params, ";")
@@ -148,12 +148,12 @@ func transformSGR(params string, factor float64) string {
 		switch {
 		case code == 0:
 			// Reset — emit reset + re-apply dim default foreground.
-			out = append(out, "0", "38", "2", "73", "80", "87")
+			out = append(out, "0", "38", "2", "137", "150", "163")
 			i++
 
 		case code == 39:
 			// Default foreground — replace with dim default.
-			out = append(out, "38", "2", "73", "80", "87")
+			out = append(out, "38", "2", "137", "150", "163")
 			i++
 
 		case code == 49:

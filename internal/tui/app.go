@@ -127,12 +127,12 @@ type Model struct {
 	tmuxSocket string
 
 	// Project selection state
-	projects             []*database.Project
-	filteredProjects     []*database.Project
-	projectCursor        int
-	projectScrollOffset  int
-	projectInput         textinput.Model
-	noProjectMode        bool
+	projects            []*database.Project
+	filteredProjects    []*database.Project
+	projectCursor       int
+	projectScrollOffset int
+	projectInput        textinput.Model
+	noProjectMode       bool
 
 	// Window dimensions
 	windowWidth  int
@@ -145,10 +145,10 @@ type Model struct {
 	deleteFromArchived   bool
 
 	// Spinner for creating state
-	spinner            spinner.Model
-	err                error
-	message            string
-	settingUpSessions  map[string]bool
+	spinner           spinner.Model
+	err               error
+	message           string
+	settingUpSessions map[string]bool
 
 	// Session creation fields
 	createInput        textinput.Model
@@ -1722,7 +1722,7 @@ func (m *Model) maxVisibleSessions() int {
 // sidebarHitTest maps a mouse Y coordinate to the sidebar element at that position.
 // Returns a kind string and an index (meaningful only for "session").
 func (m *Model) sidebarHitTest(y int) (kind string, index int) {
-	y++ // empirical offset: Bubble Tea mouse Y is 1 above rendered row
+	y++              // empirical offset: Bubble Tea mouse Y is 1 above rendered row
 	towerHeight := 8 // lines consumed by the tower + blank + top border
 	if y < towerHeight {
 		return "tower", 0
@@ -1974,7 +1974,7 @@ func (m *Model) viewSidebar() string {
 	}
 
 	// Fill remaining space
-	towerHeight := 8 // 6 tower lines + 1 blank line + 1 custom top border
+	towerHeight := 8                                  // 6 tower lines + 1 blank line + 1 custom top border
 	sidebarHeight := m.windowHeight - towerHeight - 1 // minus tower, minus bottom border only
 	if sidebarHeight < 1 {
 		sidebarHeight = 1
@@ -2082,7 +2082,7 @@ func (m *Model) viewTerminal() string {
 
 			// Dim terminal content when sidebar is focused
 			if m.focus == focusSidebar {
-				rendered = dimANSIColors(rendered, 0.4)
+				rendered = dimANSIColors(rendered, 0.75)
 			}
 
 			return rendered
