@@ -370,12 +370,13 @@ func (t *Terminal) keyMsgToTmuxArgs(msg tea.KeyMsg) []string {
 	}
 
 	// For Alt + multi-byte named keys (arrows, function keys, etc.), send
-	// Escape then the key name as separate args. These are multi-byte escape
-	// sequences themselves, so the receiving Bubble Tea instance will buffer
-	// them via detectSequence/canHaveMoreData rather than treating a lone
-	// ESC as standalone.
+	// ESC + the raw escape sequence as a single literal via -l so both
+	// arrive in one PTY write. Sending them as separate tmux args causes
+	// two writes, making the shell see a standalone Escape + a plain key.
 	if msg.Alt {
-		return append(base, "Escape", tmuxKey)
+		if seq := keySequence(msg.Type); seq != "" {
+			return append(base, "-l", "\x1b"+seq)
+		}
 	}
 
 	return append(base, tmuxKey)
@@ -448,6 +449,126 @@ func keyByte(kt tea.KeyType) byte {
 		return 26
 	}
 	return 0
+}
+
+// keySequence returns the raw terminal escape sequence for multi-byte key
+// types (arrows, navigation, function keys), or "" if unknown. These match
+// the sequences in Bubble Tea's key.go sequences map.
+func keySequence(kt tea.KeyType) string {
+	switch kt {
+	// Arrow keys
+	case tea.KeyUp:
+		return "\x1b[A"
+	case tea.KeyDown:
+		return "\x1b[B"
+	case tea.KeyRight:
+		return "\x1b[C"
+	case tea.KeyLeft:
+		return "\x1b[D"
+
+	// Shift+Arrow keys
+	case tea.KeyShiftUp:
+		return "\x1b[1;2A"
+	case tea.KeyShiftDown:
+		return "\x1b[1;2B"
+	case tea.KeyShiftRight:
+		return "\x1b[1;2C"
+	case tea.KeyShiftLeft:
+		return "\x1b[1;2D"
+
+	// Ctrl+Arrow keys
+	case tea.KeyCtrlUp:
+		return "\x1b[1;5A"
+	case tea.KeyCtrlDown:
+		return "\x1b[1;5B"
+	case tea.KeyCtrlRight:
+		return "\x1b[1;5C"
+	case tea.KeyCtrlLeft:
+		return "\x1b[1;5D"
+
+	// Ctrl+Shift+Arrow keys
+	case tea.KeyCtrlShiftUp:
+		return "\x1b[1;6A"
+	case tea.KeyCtrlShiftDown:
+		return "\x1b[1;6B"
+	case tea.KeyCtrlShiftRight:
+		return "\x1b[1;6C"
+	case tea.KeyCtrlShiftLeft:
+		return "\x1b[1;6D"
+
+	// Navigation keys
+	case tea.KeyHome:
+		return "\x1b[H"
+	case tea.KeyEnd:
+		return "\x1b[F"
+	case tea.KeyShiftHome:
+		return "\x1b[1;2H"
+	case tea.KeyShiftEnd:
+		return "\x1b[1;2F"
+	case tea.KeyCtrlHome:
+		return "\x1b[1;5H"
+	case tea.KeyCtrlEnd:
+		return "\x1b[1;5F"
+	case tea.KeyCtrlShiftHome:
+		return "\x1b[1;6H"
+	case tea.KeyCtrlShiftEnd:
+		return "\x1b[1;6F"
+	case tea.KeyInsert:
+		return "\x1b[2~"
+	case tea.KeyDelete:
+		return "\x1b[3~"
+	case tea.KeyPgUp:
+		return "\x1b[5~"
+	case tea.KeyPgDown:
+		return "\x1b[6~"
+	case tea.KeyCtrlPgUp:
+		return "\x1b[5;5~"
+	case tea.KeyCtrlPgDown:
+		return "\x1b[6;5~"
+
+	// Function keys
+	case tea.KeyF1:
+		return "\x1bOP"
+	case tea.KeyF2:
+		return "\x1bOQ"
+	case tea.KeyF3:
+		return "\x1bOR"
+	case tea.KeyF4:
+		return "\x1bOS"
+	case tea.KeyF5:
+		return "\x1b[15~"
+	case tea.KeyF6:
+		return "\x1b[17~"
+	case tea.KeyF7:
+		return "\x1b[18~"
+	case tea.KeyF8:
+		return "\x1b[19~"
+	case tea.KeyF9:
+		return "\x1b[20~"
+	case tea.KeyF10:
+		return "\x1b[21~"
+	case tea.KeyF11:
+		return "\x1b[23~"
+	case tea.KeyF12:
+		return "\x1b[24~"
+	case tea.KeyF13:
+		return "\x1b[25~"
+	case tea.KeyF14:
+		return "\x1b[26~"
+	case tea.KeyF15:
+		return "\x1b[28~"
+	case tea.KeyF16:
+		return "\x1b[29~"
+	case tea.KeyF17:
+		return "\x1b[31~"
+	case tea.KeyF18:
+		return "\x1b[32~"
+	case tea.KeyF19:
+		return "\x1b[33~"
+	case tea.KeyF20:
+		return "\x1b[34~"
+	}
+	return ""
 }
 
 // Render returns the current terminal content as an ANSI string.
