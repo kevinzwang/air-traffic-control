@@ -7,6 +7,7 @@ func TestIsWordChar(t *testing.T) {
 		r    rune
 		want bool
 	}{
+		// Alphanumeric + underscore (still word chars)
 		{'a', true},
 		{'z', true},
 		{'A', true},
@@ -14,13 +15,45 @@ func TestIsWordChar(t *testing.T) {
 		{'0', true},
 		{'9', true},
 		{'_', true},
+
+		// Now treated as word chars (not separators)
+		{'-', true},
+		{'.', true},
+		{'/', true},
+		{'+', true},
+		{'~', true},
+		{':', true},
+		{'@', true},
+		{'#', true},
+		{'$', true},
+		{'%', true},
+		{'^', true},
+		{'&', true},
+		{'*', true},
+		{'=', true},
+		{'<', true},
+		{'>', true},
+		{'?', true},
+		{'!', true},
+		{';', true},
+		{'\\', true},
+
+		// Whitespace (not word chars)
 		{' ', false},
 		{'\t', false},
-		{'.', false},
-		{'-', false},
-		{'/', false},
+
+		// Separators (not word chars)
 		{'(', false},
-		{'!', false},
+		{')', false},
+		{'[', false},
+		{']', false},
+		{'{', false},
+		{'}', false},
+		{'\'', false},
+		{',', false},
+		{'"', false},
+		{'`', false},
+		{'|', false},
 	}
 	for _, tt := range tests {
 		got := isWordChar(tt.r)
@@ -74,11 +107,11 @@ func TestWordBoundsAt(t *testing.T) {
 			wantEnd:   5,
 		},
 		{
-			name:      "punctuation run",
+			name:      "colon now part of word",
 			input:     "foo::bar",
 			col:       3,
-			wantStart: 3,
-			wantEnd:   4,
+			wantStart: 0,
+			wantEnd:   7,
 		},
 		{
 			name:      "underscore in word",
@@ -123,8 +156,43 @@ func TestWordBoundsAt(t *testing.T) {
 			wantEnd:   5,
 		},
 		{
-			name:      "punctuation at start",
+			name:      "dots now part of word",
 			input:     "...hello",
+			col:       1,
+			wantStart: 0,
+			wantEnd:   7,
+		},
+		{
+			name:      "file path",
+			input:     "/usr/local/bin",
+			col:       5,
+			wantStart: 0,
+			wantEnd:   13,
+		},
+		{
+			name:      "branch name with hyphen",
+			input:     "feature-branch",
+			col:       3,
+			wantStart: 0,
+			wantEnd:   13,
+		},
+		{
+			name:      "file with line number",
+			input:     "file.go:42",
+			col:       4,
+			wantStart: 0,
+			wantEnd:   9,
+		},
+		{
+			name:      "parens as boundary",
+			input:     "foo(bar)",
+			col:       1,
+			wantStart: 0,
+			wantEnd:   2,
+		},
+		{
+			name:      "pipe as boundary",
+			input:     "cmd | grep",
 			col:       1,
 			wantStart: 0,
 			wantEnd:   2,

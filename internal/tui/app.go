@@ -2505,9 +2505,15 @@ func skipAnsi(s string, skip int) string {
 
 // --- Text selection ---
 
-// isWordChar returns true for characters considered part of a word (alphanumeric + underscore).
+// wordSeparators defines characters that break word selection on double-click.
+// Matches VS Code integrated terminal defaults.
+const wordSeparators = " ()[]{}',\"`\u2500\u2018\u2019\u201c\u201d|"
+
+// isWordChar returns true for characters considered part of a word.
+// Uses a separator-based approach: anything that isn't whitespace or a
+// separator is treated as a word character.
 func isWordChar(r rune) bool {
-	return r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r)
+	return !unicode.IsSpace(r) && !strings.ContainsRune(wordSeparators, r)
 }
 
 // wordBoundsAt finds the extent of the character class at col within runes.
