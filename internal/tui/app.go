@@ -186,11 +186,6 @@ type Model struct {
 
 	// Drag extension mode
 	selMode selectionMode
-
-	// Budget of SGR mouse fragment characters to suppress (over SSH,
-	// TCP can split escape sequences and Bubble Tea parses the tail
-	// bytes as individual key events). Reset after each mouse event.
-	mouseFragmentBudget int
 }
 
 func NewModel(db *database.DB, service *session.Service, repoName string, invokingBranch string) *Model {
@@ -583,8 +578,6 @@ func (m *Model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) handleMouseMsg(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
-	m.mouseFragmentBudget = 15 // max bytes in one SGR mouse seq after ESC
-
 	// Dispatch overlay mouse events first
 	if m.overlay != overlayNone {
 		return m.handleOverlayMouse(msg)
@@ -768,7 +761,7 @@ func (m *Model) handleMouseMsg(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.hasSelection = false
-		t.ScrollUp(2)
+		t.ScrollUp(3)
 		return m, nil
 
 	case msg.Button == tea.MouseButtonWheelDown:
@@ -780,7 +773,7 @@ func (m *Model) handleMouseMsg(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.hasSelection = false
-		t.ScrollDown(2)
+		t.ScrollDown(3)
 		return m, nil
 	}
 	return m, nil
@@ -1206,28 +1199,6 @@ func (m *Model) handleTerminalKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		_, th := m.terminalPaneDimensions()
 		t.ScrollDown(th / 2)
 		return m, nil
-	}
-
-	// Suppress SGR mouse escape sequence fragments split across TCP packets
-	// (common over SSH). A fragmented \x1b[<Cb;Cx;CyM yields an ESC key
-	// event followed by individual rune keys: [ < 0-9 ; M m.
-	// Each MouseMsg grants a budget; we eat matching chars until consumed.
-	// We intentionally do NOT reset the budget on non-matching events,
-	// because ESC (KeyEscape) arrives between fragments and would clear it.
-	if m.mouseFragmentBudget > 0 {
-		// ESC is the leading byte of mouse sequences; eat it while in
-		// scroll mode to prevent it from prematurely exiting scroll mode.
-		if msg.Type == tea.KeyEscape && t.IsScrollMode() {
-			m.mouseFragmentBudget--
-			return m, nil
-		}
-		if msg.Type == tea.KeyRunes && len(msg.Runes) == 1 {
-			r := msg.Runes[0]
-			if r == '[' || r == '<' || r == ';' || r == 'M' || r == 'm' || (r >= '0' && r <= '9') {
-				m.mouseFragmentBudget--
-				return m, nil
-			}
-		}
 	}
 
 	// Any other key exits scroll mode (don't forward to tmux —
