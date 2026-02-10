@@ -187,6 +187,42 @@ func (db *DB) UnarchiveSession(id string) error {
 	return nil
 }
 
+// Project represents a unique repository tracked in the database
+type Project struct {
+	RepoName string
+	RepoPath string
+}
+
+// ListProjects returns all unique projects ordered by most recently used
+func (db *DB) ListProjects() ([]*Project, error) {
+	query := `
+		SELECT repo_name, repo_path
+		FROM sessions
+		GROUP BY repo_name, repo_path
+		ORDER BY MAX(COALESCE(last_accessed, created_at)) DESC
+	`
+
+	rows, err := db.conn.Query(query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list projects: %w", err)
+	}
+	defer rows.Close()
+
+	var projects []*Project
+	for rows.Next() {
+		var p Project
+		if err := rows.Scan(&p.RepoName, &p.RepoPath); err != nil {
+			return nil, fmt.Errorf("failed to scan project: %w", err)
+		}
+		projects = append(projects, &p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating projects: %w", err)
+	}
+
+	return projects, nil
+}
+
 // DeleteSession removes a session from the database
 func (db *DB) DeleteSession(id string) error {
 	query := `DELETE FROM sessions WHERE id = ?`
