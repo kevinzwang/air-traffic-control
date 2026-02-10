@@ -14,6 +14,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/kevinzwang/air-traffic-control/internal/database"
 	"github.com/kevinzwang/air-traffic-control/internal/session"
 	"github.com/kevinzwang/air-traffic-control/internal/terminal"
 	"github.com/kevinzwang/air-traffic-control/internal/worktree"
@@ -46,6 +47,7 @@ const (
 	overlayHelp
 	overlayCreating
 	overlayArchivedSessions
+	overlaySelectProject
 )
 
 // Custom messages
@@ -84,10 +86,20 @@ type branchesLoadedMsg struct {
 	branchesWithSessions map[string]bool
 }
 
+type projectsLoadedMsg struct {
+	projects []*database.Project
+}
+
+type projectSwitchedMsg struct {
+	service  *session.Service
+	repoName string
+}
+
 type Model struct {
 	// Core state
 	focus         focus
 	overlay       overlay
+	db            *database.DB
 	service       *session.Service
 	repoName      string
 	sessions      []*session.Session
@@ -99,6 +111,14 @@ type Model struct {
 	terminals  map[string]*terminal.Terminal
 	program    *tea.Program
 	tmuxSocket string
+
+	// Project selection state
+	projects             []*database.Project
+	filteredProjects     []*database.Project
+	projectCursor        int
+	projectScrollOffset  int
+	projectInput         textinput.Model
+	noProjectMode        bool
 
 	// Window dimensions
 	windowWidth  int
@@ -145,17 +165,21 @@ type Model struct {
 	hasSelection bool // selection is visible
 }
 
-func NewModel(service *session.Service, repoName string, invokingBranch string) *Model {
+func NewModel(db *database.DB, service *session.Service, repoName string, invokingBranch string) *Model {
 	s := spinner.New()
 	s.Spinner = spinner.Dot
 
-	// Stable socket name based on repo path so tmux sessions persist across ATC restarts
-	hash := sha256.Sum256([]byte(service.RepoPath()))
-	tmuxSocket := fmt.Sprintf("atc-%x", hash[:4])
+	var tmuxSocket string
+	if service != nil {
+		// Stable socket name based on repo path so tmux sessions persist across ATC restarts
+		hash := sha256.Sum256([]byte(service.RepoPath()))
+		tmuxSocket = fmt.Sprintf("atc-%x", hash[:4])
+	}
 
 	return &Model{
 		focus:             focusSidebar,
 		overlay:           overlayNone,
+		db:                db,
 		service:           service,
 		repoName:          repoName,
 		spinner:           s,
@@ -163,6 +187,7 @@ func NewModel(service *session.Service, repoName string, invokingBranch string) 
 		terminals:         make(map[string]*terminal.Terminal),
 		tmuxSocket:        tmuxSocket,
 		settingUpSessions: make(map[string]bool),
+		noProjectMode:     service == nil,
 	}
 }
 
@@ -172,6 +197,12 @@ func (m *Model) SetProgram(p *tea.Program) {
 }
 
 func (m *Model) Init() tea.Cmd {
+	if m.noProjectMode {
+		return tea.Batch(
+			m.loadProjects(),
+			m.spinner.Tick,
+		)
+	}
 	return tea.Batch(
 		m.loadSessions(),
 		m.spinner.Tick,
@@ -191,6 +222,9 @@ func (m *Model) detachTerminal(name string) {
 
 func (m *Model) loadSessions() tea.Cmd {
 	return func() tea.Msg {
+		if m.service == nil {
+			return sessionsLoadedMsg{sessions: nil}
+		}
 		sessions, err := m.service.ListSessions("")
 		if err != nil {
 			return errMsg{err}
@@ -201,6 +235,9 @@ func (m *Model) loadSessions() tea.Cmd {
 
 func (m *Model) loadBranches() tea.Cmd {
 	return func() tea.Msg {
+		if m.service == nil {
+			return errMsg{fmt.Errorf("no project selected")}
+		}
 		branches, err := m.service.ListBranches()
 		if err != nil {
 			return errMsg{err}
@@ -218,6 +255,26 @@ func (m *Model) loadBranches() tea.Cmd {
 			branches:             branches,
 			branchesWithSessions: branchesWithSessions,
 		}
+	}
+}
+
+func (m *Model) loadProjects() tea.Cmd {
+	return func() tea.Msg {
+		projects, err := m.db.ListProjects()
+		if err != nil {
+			return errMsg{err}
+		}
+		return projectsLoadedMsg{projects}
+	}
+}
+
+func (m *Model) switchProject(project *database.Project) tea.Cmd {
+	return func() tea.Msg {
+		svc, err := session.NewService(m.db, project.RepoPath)
+		if err != nil {
+			return errMsg{err}
+		}
+		return projectSwitchedMsg{service: svc, repoName: project.RepoName}
 	}
 }
 
@@ -335,6 +392,30 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case projectsLoadedMsg:
+		m.projects = msg.projects
+		m.filteredProjects = msg.projects
+		m.projectCursor = 0
+		m.projectScrollOffset = 0
+		if m.noProjectMode || m.overlay == overlaySelectProject {
+			m.initProjectInput()
+			m.overlay = overlaySelectProject
+		}
+		return m, nil
+
+	case projectSwitchedMsg:
+		m.service = msg.service
+		m.repoName = msg.repoName
+		// Recompute tmux socket for the new project
+		hash := sha256.Sum256([]byte(msg.service.RepoPath()))
+		m.tmuxSocket = fmt.Sprintf("atc-%x", hash[:4])
+		m.activeSession = nil
+		m.cursor = 0
+		m.scrollOffset = 0
+		m.noProjectMode = false
+		m.overlay = overlayNone
+		return m, m.loadSessions()
+
 	case errMsg:
 		m.err = msg.err
 		if m.overlay == overlayCreating {
@@ -374,7 +455,9 @@ func (m *Model) activateSession(sess *session.Session, switchFocus bool) tea.Cmd
 			return errMsg{err}
 		}
 
-		m.service.TouchSession(sess.Name)
+		if m.service != nil {
+			m.service.TouchSession(sess.Name)
+		}
 		m.activatingSession = ""
 		return nil
 	}
@@ -384,6 +467,10 @@ func (m *Model) activateSession(sess *session.Session, switchFocus bool) tea.Cmd
 // It reuses an existing wrapper, reattaches to a persisted tmux session,
 // or creates a new tmux session as needed.
 func (m *Model) ensureTerminal(sess *session.Session, width, height int) error {
+	if m.tmuxSocket == "" {
+		return fmt.Errorf("no project selected")
+	}
+
 	// If we have a running terminal wrapper, just resize
 	if t, ok := m.terminals[sess.Name]; ok && t.IsRunning() {
 		t.Resize(width, height)
@@ -641,6 +728,8 @@ func (m *Model) handleOverlayMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			return m.handleBranchOverlayClick(msg)
 		case overlayArchivedSessions:
 			return m.handleArchivedOverlayClick(msg)
+		case overlaySelectProject:
+			return m.handleProjectOverlayClick(msg)
 		}
 		return m, nil
 
@@ -658,6 +747,13 @@ func (m *Model) handleOverlayMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 				m.archivedCursor--
 				if m.archivedCursor < m.archivedScrollOffset {
 					m.archivedScrollOffset = m.archivedCursor
+				}
+			}
+		case overlaySelectProject:
+			if m.projectCursor > 0 {
+				m.projectCursor--
+				if m.projectCursor < m.projectScrollOffset {
+					m.projectScrollOffset = m.projectCursor
 				}
 			}
 		}
@@ -687,6 +783,14 @@ func (m *Model) handleOverlayMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 				maxVisible := 10
 				if m.archivedCursor >= m.archivedScrollOffset+maxVisible {
 					m.archivedScrollOffset = m.archivedCursor - maxVisible + 1
+				}
+			}
+		case overlaySelectProject:
+			if m.projectCursor < len(m.filteredProjects)-1 {
+				m.projectCursor++
+				maxVisible := 10
+				if m.projectCursor >= m.projectScrollOffset+maxVisible {
+					m.projectScrollOffset = m.projectCursor - maxVisible + 1
 				}
 			}
 		}
@@ -883,6 +987,9 @@ func (m *Model) handleSidebarKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleEnter()
 
 	case "n":
+		if m.service == nil {
+			return m, nil
+		}
 		return m.openCreateOverlay()
 
 	case "d":
@@ -890,6 +997,11 @@ func (m *Model) handleSidebarKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "a":
 		return m.handleArchive()
+
+	case "p":
+		m.initProjectInput()
+		m.overlay = overlaySelectProject
+		return m, m.loadProjects()
 
 	case "?":
 		m.overlay = overlayHelp
@@ -991,7 +1103,7 @@ func (m *Model) openDeleteOverlay() (tea.Model, tea.Cmd) {
 
 func (m *Model) handleArchive() (tea.Model, tea.Cmd) {
 	active := m.activeSessions()
-	if len(active) == 0 || m.cursor >= len(active) {
+	if len(active) == 0 || m.cursor >= len(active) || m.service == nil {
 		return m, nil
 	}
 	selected := active[m.cursor]
@@ -1025,6 +1137,8 @@ func (m *Model) handleOverlayKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case overlayArchivedSessions:
 		return m.handleArchivedOverlayKeys(msg)
+	case overlaySelectProject:
+		return m.handleSelectProjectKeys(msg)
 	}
 	return m, nil
 }
@@ -1060,6 +1174,12 @@ func (m *Model) dismissOverlay() (tea.Model, tea.Cmd) {
 		}
 		m.selectedSession = nil
 	case overlayArchivedSessions:
+		m.overlay = overlayNone
+	case overlaySelectProject:
+		if m.noProjectMode {
+			// Can't dismiss project picker when launched outside a git repo
+			return m, tea.Quit
+		}
 		m.overlay = overlayNone
 	case overlayCreating:
 		// Cannot dismiss while creating
@@ -1267,6 +1387,9 @@ func (m *Model) handleDeleteConfirmKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			delete(m.terminals, name)
 		}
 		return m, func() tea.Msg {
+			if m.service == nil {
+				return errMsg{fmt.Errorf("no project selected")}
+			}
 			if err := m.service.DeleteSession(name); err != nil {
 				return errMsg{err}
 			}
@@ -1303,6 +1426,9 @@ func (m *Model) doCreateSession(baseBranch string, useExisting bool) tea.Cmd {
 	m.overlay = overlayCreating
 
 	return func() tea.Msg {
+		if m.service == nil {
+			return errMsg{fmt.Errorf("no project selected")}
+		}
 		sess, setupCmds, err := m.service.CreateSession(name, baseBranch, useExisting)
 		if err != nil {
 			return errMsg{err}
@@ -1615,7 +1741,11 @@ func (m *Model) viewSidebar() string {
 		borderColor = textDim
 	}
 	borderStyle := lipgloss.NewStyle().Foreground(borderColor)
-	repoName := truncate(m.repoName, innerWidth-2)
+	repoName := m.repoName
+	if repoName == "" {
+		repoName = "ATC"
+	}
+	repoName = truncate(repoName, innerWidth-2)
 	fillLen := innerWidth - 2 - len(repoName) // innerWidth minus spaces and name
 	if fillLen < 0 {
 		fillLen = 0
@@ -1788,7 +1918,12 @@ func (m *Model) viewTerminal() string {
 	// Placeholder content — use lipgloss to fill the pane
 	var content string
 	if m.activeSession == nil {
-		placeholder := placeholderStyle.Render("Select a session or press 'n' to create one")
+		var placeholder string
+		if m.noProjectMode {
+			placeholder = placeholderStyle.Render("Press 'p' to select a project")
+		} else {
+			placeholder = placeholderStyle.Render("Select a session or press 'n' to create one")
+		}
 		content = "\n\n" + centerText(placeholder, tw)
 	} else {
 		placeholder := placeholderStyle.Render("Press Enter to start session")
@@ -1821,6 +1956,8 @@ func (m *Model) viewOverlay() string {
 		return m.viewCreatingOverlay()
 	case overlayArchivedSessions:
 		return m.viewArchivedOverlay()
+	case overlaySelectProject:
+		return m.viewSelectProject()
 	}
 	return ""
 }
@@ -2044,6 +2181,8 @@ func (m *Model) viewHelpOverlay() string {
 	b.WriteString("\n")
 	b.WriteString(dialogTextStyle.Render("  a            Archive session"))
 	b.WriteString("\n")
+	b.WriteString(dialogTextStyle.Render("  p            Switch project"))
+	b.WriteString("\n")
 	b.WriteString(dialogTextStyle.Render("  q            Quit ATC"))
 	b.WriteString("\n\n")
 	b.WriteString(dialogTextStyle.Render("Terminal:"))
@@ -2106,7 +2245,7 @@ func (m *Model) handleArchivedOverlayKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "u":
-		if len(m.archivedList) == 0 || m.archivedCursor >= len(m.archivedList) {
+		if len(m.archivedList) == 0 || m.archivedCursor >= len(m.archivedList) || m.service == nil {
 			return m, nil
 		}
 		selected := m.archivedList[m.archivedCursor]
@@ -2471,6 +2610,223 @@ func (m *Model) getSelectedText() string {
 	}
 
 	return sb.String()
+}
+
+// handleProjectOverlayClick handles clicks inside the project selection overlay.
+func (m *Model) handleProjectOverlayClick(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	if len(m.filteredProjects) == 0 {
+		return m, nil
+	}
+
+	startRow, _, _, _ := m.overlayBounds()
+	// border + padding + title + blank + input + blank = 6 lines before list
+	listStart := startRow + 6
+
+	clickedIdx := msg.Y - listStart
+	if clickedIdx < 0 {
+		return m, nil
+	}
+
+	lineOffset := 0
+	if m.projectScrollOffset > 0 {
+		if clickedIdx == 0 {
+			if m.projectCursor > 0 {
+				m.projectCursor--
+				if m.projectCursor < m.projectScrollOffset {
+					m.projectScrollOffset = m.projectCursor
+				}
+			}
+			return m, nil
+		}
+		lineOffset = 1
+	}
+
+	maxVisible := 10
+	endIdx := m.projectScrollOffset + maxVisible
+	if endIdx > len(m.filteredProjects) {
+		endIdx = len(m.filteredProjects)
+	}
+
+	itemIdx := clickedIdx - lineOffset
+	if itemIdx >= 0 && m.projectScrollOffset+itemIdx < endIdx {
+		m.projectCursor = m.projectScrollOffset + itemIdx
+	}
+
+	return m, nil
+}
+
+// --- Project selection overlay ---
+
+func (m *Model) initProjectInput() {
+	m.projectInput = textinput.New()
+	m.projectInput.Placeholder = "Filter projects..."
+	m.projectInput.Focus()
+	m.projectInput.CharLimit = 100
+	m.projectInput.Width = 40
+	m.projectCursor = 0
+	m.projectScrollOffset = 0
+}
+
+func (m *Model) filterProjects() {
+	query := strings.ToLower(strings.TrimSpace(m.projectInput.Value()))
+	if query == "" {
+		m.filteredProjects = m.projects
+	} else {
+		m.filteredProjects = nil
+		for _, p := range m.projects {
+			if strings.Contains(strings.ToLower(p.RepoName), query) || strings.Contains(strings.ToLower(p.RepoPath), query) {
+				m.filteredProjects = append(m.filteredProjects, p)
+			}
+		}
+	}
+}
+
+func (m *Model) handleSelectProjectKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	totalItems := len(m.filteredProjects)
+
+	switch msg.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+	case "esc":
+		return m.dismissOverlay()
+
+	case "up", "k":
+		if m.projectCursor > 0 {
+			m.projectCursor--
+			if m.projectCursor < m.projectScrollOffset {
+				m.projectScrollOffset = m.projectCursor
+			}
+		}
+		return m, nil
+
+	case "down", "j":
+		if m.projectCursor < totalItems-1 {
+			m.projectCursor++
+			maxVisible := 10
+			if m.projectCursor >= m.projectScrollOffset+maxVisible {
+				m.projectScrollOffset = m.projectCursor - maxVisible + 1
+			}
+		}
+		return m, nil
+
+	case "enter":
+		if totalItems == 0 || m.projectCursor >= totalItems {
+			return m, nil
+		}
+		selected := m.filteredProjects[m.projectCursor]
+		// Check if selecting the current project (no-op)
+		if m.service != nil && m.service.RepoPath() == selected.RepoPath {
+			m.overlay = overlayNone
+			return m, nil
+		}
+		// Detach all terminals before switching
+		for name, t := range m.terminals {
+			t.Detach()
+			delete(m.terminals, name)
+		}
+		return m, m.switchProject(selected)
+
+	default:
+		var cmd tea.Cmd
+		m.projectInput, cmd = m.projectInput.Update(msg)
+		m.filterProjects()
+		if m.projectCursor >= len(m.filteredProjects) {
+			m.projectCursor = len(m.filteredProjects) - 1
+			if m.projectCursor < 0 {
+				m.projectCursor = 0
+			}
+		}
+		m.projectScrollOffset = 0
+		return m, cmd
+	}
+}
+
+func (m *Model) viewSelectProject() string {
+	var b strings.Builder
+	b.WriteString(titleStyle.Render("Switch Project"))
+	b.WriteString("\n\n")
+	b.WriteString(m.projectInput.View())
+	b.WriteString("\n\n")
+
+	if len(m.filteredProjects) == 0 {
+		if len(m.projects) == 0 {
+			b.WriteString(metadataStyle.Render("  No projects found") + "\n")
+		} else {
+			b.WriteString(metadataStyle.Render("  No projects match filter") + "\n")
+		}
+	} else {
+		maxVisible := 10
+		startIdx := m.projectScrollOffset
+		endIdx := startIdx + maxVisible
+		if endIdx > len(m.filteredProjects) {
+			endIdx = len(m.filteredProjects)
+		}
+
+		// Compute max item width
+		helpText := "[↑/↓] Navigate  [Enter] Select  [Esc] Cancel"
+		if m.noProjectMode {
+			helpText = "[↑/↓] Navigate  [Enter] Select  [Esc] Quit"
+		}
+		itemWidth := len(helpText)
+
+		// Check for duplicate repo names to decide if we need path disambiguation
+		nameCount := make(map[string]int)
+		for _, p := range m.filteredProjects {
+			nameCount[p.RepoName]++
+		}
+
+		for i := startIdx; i < endIdx; i++ {
+			p := m.filteredProjects[i]
+			label := p.RepoName
+			if nameCount[p.RepoName] > 1 {
+				label = fmt.Sprintf("%s (%s)", p.RepoName, truncatePath(p.RepoPath, 30))
+			}
+			if m.service != nil && m.service.RepoPath() == p.RepoPath {
+				label += " (current)"
+			}
+			if len(label) > itemWidth {
+				itemWidth = len(label)
+			}
+		}
+
+		if startIdx > 0 {
+			b.WriteString(metadataStyle.Render(fmt.Sprintf("  ↑ %d more", startIdx)) + "\n")
+		}
+		for i := startIdx; i < endIdx; i++ {
+			p := m.filteredProjects[i]
+			label := p.RepoName
+			if nameCount[p.RepoName] > 1 {
+				label = fmt.Sprintf("%s (%s)", p.RepoName, truncatePath(p.RepoPath, 30))
+			}
+			if m.service != nil && m.service.RepoPath() == p.RepoPath {
+				label += " (current)"
+			}
+			if m.projectCursor == i {
+				b.WriteString(selectedItemStyle.Width(itemWidth).Render(label) + "\n")
+			} else {
+				b.WriteString(normalItemStyle.Width(itemWidth).Render(label) + "\n")
+			}
+		}
+		if endIdx < len(m.filteredProjects) {
+			b.WriteString(metadataStyle.Render(fmt.Sprintf("  ↓ %d more", len(m.filteredProjects)-endIdx)) + "\n")
+		}
+	}
+
+	b.WriteString("\n")
+	if m.noProjectMode {
+		b.WriteString(helpStyle.Render("[↑/↓] Navigate  [Enter] Select  [Esc] Quit"))
+	} else {
+		b.WriteString(helpStyle.Render("[↑/↓] Navigate  [Enter] Select  [Esc] Cancel"))
+	}
+	return dialogBoxStyle.Render(b.String())
+}
+
+// truncatePath shortens a path for display, keeping the last components
+func truncatePath(path string, maxLen int) string {
+	if len(path) <= maxLen {
+		return path
+	}
+	return "..." + path[len(path)-maxLen+3:]
 }
 
 // copySelectionToClipboard copies the selected text to the system clipboard.
