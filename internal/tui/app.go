@@ -8,6 +8,8 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/spinner"
@@ -47,6 +49,17 @@ const (
 	overlayCreating
 	overlayArchivedSessions
 )
+
+// Selection mode for multi-click
+type selectionMode int
+
+const (
+	selModeChar selectionMode = iota
+	selModeWord
+	selModeLine
+)
+
+const multiClickThreshold = 500 * time.Millisecond
 
 // Custom messages
 type sessionsLoadedMsg struct {
@@ -143,6 +156,15 @@ type Model struct {
 	selEndCol    int  // current drag column
 	selEndRow    int  // current drag row
 	hasSelection bool // selection is visible
+
+	// Multi-click detection
+	lastClickTime time.Time
+	lastClickCol  int
+	lastClickRow  int
+	clickCount    int
+
+	// Drag extension mode
+	selMode selectionMode
 }
 
 func NewModel(service *session.Service, repoName string, invokingBranch string) *Model {
@@ -476,18 +498,60 @@ func (m *Model) handleMouseMsg(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		// Start selection if click is in terminal pane area
 		if msg.X >= termStartX && m.activeSession != nil {
 			col, row := m.mouseToTermCoords(msg.X, msg.Y, termStartX)
-			m.selecting = true
-			m.selStartCol = col
-			m.selStartRow = row
-			m.selEndCol = col
-			m.selEndRow = row
-			m.hasSelection = false
+
+			// Detect multi-click
+			now := time.Now()
+			if time.Since(m.lastClickTime) < multiClickThreshold && col == m.lastClickCol && row == m.lastClickRow {
+				m.clickCount++
+				if m.clickCount > 3 {
+					m.clickCount = 1
+				}
+			} else {
+				m.clickCount = 1
+			}
+			m.lastClickTime = now
+			m.lastClickCol = col
+			m.lastClickRow = row
+
 			// Click on terminal switches focus
 			if m.focus == focusSidebar {
 				m.message = ""
 				m.err = nil
 				m.focus = focusTerminal
 				m.resizeTerminalIfNeeded()
+			}
+
+			switch m.clickCount {
+			case 1:
+				// Single click: character selection mode
+				m.selecting = true
+				m.selStartCol = col
+				m.selStartRow = row
+				m.selEndCol = col
+				m.selEndRow = row
+				m.hasSelection = false
+				m.selMode = selModeChar
+			case 2:
+				// Double click: select word
+				runes := m.getTerminalLineRunes(row)
+				wStart, wEnd := wordBoundsAt(runes, col)
+				m.selStartCol = wStart
+				m.selStartRow = row
+				m.selEndCol = wEnd
+				m.selEndRow = row
+				m.hasSelection = true
+				m.selecting = true
+				m.selMode = selModeWord
+			case 3:
+				// Triple click: select entire line
+				tw, _ := m.terminalPaneDimensions()
+				m.selStartCol = 0
+				m.selStartRow = row
+				m.selEndCol = tw - 1
+				m.selEndRow = row
+				m.hasSelection = true
+				m.selecting = true
+				m.selMode = selModeLine
 			}
 		} else {
 			m.hasSelection = false
@@ -498,8 +562,58 @@ func (m *Model) handleMouseMsg(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	case msg.Action == tea.MouseActionMotion:
 		if m.selecting {
 			col, row := m.mouseToTermCoords(msg.X, msg.Y, termStartX)
-			m.selEndCol = col
-			m.selEndRow = row
+
+			switch m.selMode {
+			case selModeChar:
+				m.selEndCol = col
+				m.selEndRow = row
+
+			case selModeWord:
+				// Extend selection by whole words, anchored on the original double-click word
+				anchorRow := m.lastClickRow
+				anchorRunes := m.getTerminalLineRunes(anchorRow)
+				anchorStart, anchorEnd := wordBoundsAt(anchorRunes, m.lastClickCol)
+
+				dragRunes := m.getTerminalLineRunes(row)
+				dragStart, dragEnd := wordBoundsAt(dragRunes, col)
+
+				if row > anchorRow || (row == anchorRow && col > anchorEnd) {
+					// Dragging forward
+					m.selStartCol = anchorStart
+					m.selStartRow = anchorRow
+					m.selEndCol = dragEnd
+					m.selEndRow = row
+				} else if row < anchorRow || (row == anchorRow && col < anchorStart) {
+					// Dragging backward
+					m.selStartCol = anchorEnd
+					m.selStartRow = anchorRow
+					m.selEndCol = dragStart
+					m.selEndRow = row
+				} else {
+					// Still within original word
+					m.selStartCol = anchorStart
+					m.selStartRow = anchorRow
+					m.selEndCol = anchorEnd
+					m.selEndRow = anchorRow
+				}
+
+			case selModeLine:
+				// Extend selection by whole lines
+				tw, _ := m.terminalPaneDimensions()
+				anchorRow := m.lastClickRow
+				if row >= anchorRow {
+					m.selStartCol = 0
+					m.selStartRow = anchorRow
+					m.selEndCol = tw - 1
+					m.selEndRow = row
+				} else {
+					m.selStartCol = 0
+					m.selStartRow = row
+					m.selEndCol = tw - 1
+					m.selEndRow = anchorRow
+				}
+			}
+
 			m.hasSelection = true
 		}
 		return m, nil
@@ -507,15 +621,22 @@ func (m *Model) handleMouseMsg(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	case msg.Action == tea.MouseActionRelease:
 		if m.selecting {
 			m.selecting = false
-			col, row := m.mouseToTermCoords(msg.X, msg.Y, termStartX)
-			m.selEndCol = col
-			m.selEndRow = row
-			// Only finalize selection if the mouse actually moved
-			if m.selStartRow != m.selEndRow || m.selStartCol != m.selEndCol {
-				m.hasSelection = true
-				m.copySelectionToClipboard()
+			if m.selMode == selModeWord || m.selMode == selModeLine {
+				// Word/line selection is already set from press/motion
+				if m.hasSelection {
+					m.copySelectionToClipboard()
+				}
 			} else {
-				m.hasSelection = false
+				col, row := m.mouseToTermCoords(msg.X, msg.Y, termStartX)
+				m.selEndCol = col
+				m.selEndRow = row
+				// Only finalize selection if the mouse actually moved
+				if m.selStartRow != m.selEndRow || m.selStartCol != m.selEndCol {
+					m.hasSelection = true
+					m.copySelectionToClipboard()
+				} else {
+					m.hasSelection = false
+				}
 			}
 		}
 		return m, nil
@@ -2055,6 +2176,10 @@ func (m *Model) viewHelpOverlay() string {
 	b.WriteString(dialogTextStyle.Render("  Scroll/PgDn  Scroll down (any key exits)"))
 	b.WriteString("\n")
 	b.WriteString(dialogTextStyle.Render("  Click+drag   Select text (copies to clipboard)"))
+	b.WriteString("\n")
+	b.WriteString(dialogTextStyle.Render("  Double-click Select word"))
+	b.WriteString("\n")
+	b.WriteString(dialogTextStyle.Render("  Triple-click Select line"))
 	b.WriteString("\n\n")
 	b.WriteString(dialogTextStyle.Render("Global:"))
 	b.WriteString("\n")
@@ -2379,6 +2504,62 @@ func skipAnsi(s string, skip int) string {
 }
 
 // --- Text selection ---
+
+// isWordChar returns true for characters considered part of a word (alphanumeric + underscore).
+func isWordChar(r rune) bool {
+	return r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r)
+}
+
+// wordBoundsAt finds the extent of the character class at col within runes.
+// Returns inclusive (start, end) bounds. Characters are grouped as: word chars,
+// whitespace, or punctuation. If col is out of bounds, returns (col, col).
+func wordBoundsAt(runes []rune, col int) (start, end int) {
+	if len(runes) == 0 || col < 0 || col >= len(runes) {
+		return col, col
+	}
+
+	ch := runes[col]
+	var sameClass func(rune) bool
+
+	switch {
+	case isWordChar(ch):
+		sameClass = isWordChar
+	case unicode.IsSpace(ch):
+		sameClass = unicode.IsSpace
+	default:
+		// Punctuation — group consecutive punctuation together
+		sameClass = func(r rune) bool {
+			return !isWordChar(r) && !unicode.IsSpace(r)
+		}
+	}
+
+	start = col
+	for start > 0 && sameClass(runes[start-1]) {
+		start--
+	}
+	end = col
+	for end < len(runes)-1 && sameClass(runes[end+1]) {
+		end++
+	}
+	return start, end
+}
+
+// getTerminalLineRunes returns the ANSI-stripped rune slice for a terminal row.
+func (m *Model) getTerminalLineRunes(row int) []rune {
+	if m.activeSession == nil {
+		return nil
+	}
+	t, ok := m.terminals[m.activeSession.Name]
+	if !ok {
+		return nil
+	}
+	content := t.Render()
+	lines := strings.Split(content, "\n")
+	if row < 0 || row >= len(lines) {
+		return nil
+	}
+	return []rune(stripANSI(lines[row]))
+}
 
 // normalizedSelection returns selection coordinates with start before end.
 func (m *Model) normalizedSelection() (startRow, startCol, endRow, endCol int) {
