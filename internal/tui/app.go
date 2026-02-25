@@ -1199,7 +1199,7 @@ func (m *Model) handleSidebarKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.overlay = overlaySelectProject
 		return m, m.loadProjects()
 
-	case "t":
+	case "s":
 		return m.handleSpawnTerminal()
 
 	case "?":
@@ -2442,7 +2442,7 @@ func (m *Model) viewHelpOverlay() string {
 	b.WriteString("\n")
 	b.WriteString(dialogTextStyle.Render("  p            Switch project"))
 	b.WriteString("\n")
-	b.WriteString(dialogTextStyle.Render("  t            Open shell in worktree"))
+	b.WriteString(dialogTextStyle.Render("  s            Open shell in worktree"))
 	b.WriteString("\n")
 	b.WriteString(dialogTextStyle.Render("  q            Quit ATC"))
 	b.WriteString("\n\n")
