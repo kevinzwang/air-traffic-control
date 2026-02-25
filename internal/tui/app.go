@@ -397,7 +397,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case sessionArchivedMsg:
 		m.message = fmt.Sprintf("Session '%s' archived", msg.name)
-		m.detachTerminal(msg.name)
+		if t, ok := m.terminals[msg.name]; ok {
+			t.Close()
+			delete(m.terminals, msg.name)
+		}
 		if m.activeSession != nil && m.activeSession.Name == msg.name {
 			m.activeSession = nil
 		}
