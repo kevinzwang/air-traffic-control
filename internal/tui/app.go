@@ -63,6 +63,9 @@ const (
 
 const multiClickThreshold = 500 * time.Millisecond
 
+// mainProjectTerminalKey is the key used in m.terminals for the main project directory session.
+const mainProjectTerminalKey = "__main_project__"
+
 // Custom messages
 type sessionsLoadedMsg struct {
 	sessions []*session.Session
@@ -239,6 +242,22 @@ func (m *Model) detachTerminal(name string) {
 		t.Detach()
 		delete(m.terminals, name)
 	}
+}
+
+// mainProjectSession returns an in-memory Session (not persisted to DB)
+// that targets the main project directory (repo root).
+func (m *Model) mainProjectSession() *session.Session {
+	return &session.Session{
+		Name:         mainProjectTerminalKey,
+		RepoPath:     m.service.RepoPath(),
+		RepoName:     m.repoName,
+		WorktreePath: m.service.RepoPath(),
+	}
+}
+
+// isProjectHeaderSelected returns true when the sidebar cursor is on the project header row.
+func (m *Model) isProjectHeaderSelected() bool {
+	return m.cursor == -1
 }
 
 // --- Data loading commands ---
@@ -431,6 +450,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case projectSwitchedMsg:
+		m.detachTerminal(mainProjectTerminalKey)
 		m.service = msg.service
 		m.repoName = msg.repoName
 		// Recompute tmux socket for the new project
@@ -501,7 +521,7 @@ func (m *Model) activateSession(sess *session.Session, switchFocus bool) tea.Cmd
 			return errMsg{err}
 		}
 
-		if m.service != nil {
+		if m.service != nil && sess.Name != mainProjectTerminalKey {
 			m.service.TouchSession(sess.Name)
 		}
 		m.activatingSession = ""
@@ -788,6 +808,12 @@ func (m *Model) handleSidebarMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 
 	kind, idx := m.sidebarHitTest(msg.Y)
 	switch kind {
+	case "tower":
+		if m.service != nil {
+			m.cursor = -1
+			return m, m.switchViewToCurrentSession()
+		}
+		return m, nil
 	case "session":
 		m.cursor = idx
 		m.adjustScroll()
@@ -1113,9 +1139,18 @@ func (m *Model) handleSidebarKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.adjustScroll()
 			return m, m.switchViewToCurrentSession()
 		}
+		if m.cursor == 0 && m.service != nil {
+			m.cursor = -1
+			return m, m.switchViewToCurrentSession()
+		}
 		return m, nil
 
 	case "down", "j":
+		if m.cursor == -1 {
+			m.cursor = 0
+			m.adjustScroll()
+			return m, m.switchViewToCurrentSession()
+		}
 		active := m.activeSessions()
 		maxIdx := len(active) - 1
 		if m.archivedCount() > 0 {
@@ -1214,6 +1249,9 @@ func (m *Model) handleTerminalKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) handleEnter() (tea.Model, tea.Cmd) {
+	if m.isProjectHeaderSelected() {
+		return m, m.activateSession(m.mainProjectSession(), true)
+	}
 	active := m.activeSessions()
 	// Cursor on the archived line?
 	if m.archivedCount() > 0 && m.cursor == len(active) {
@@ -1238,7 +1276,7 @@ func (m *Model) openCreateOverlay() (tea.Model, tea.Cmd) {
 
 func (m *Model) openDeleteOverlay() (tea.Model, tea.Cmd) {
 	active := m.activeSessions()
-	if len(active) == 0 || m.cursor >= len(active) {
+	if m.cursor < 0 || len(active) == 0 || m.cursor >= len(active) {
 		return m, nil
 	}
 	m.selectedSession = active[m.cursor]
@@ -1248,7 +1286,7 @@ func (m *Model) openDeleteOverlay() (tea.Model, tea.Cmd) {
 
 func (m *Model) handleArchive() (tea.Model, tea.Cmd) {
 	active := m.activeSessions()
-	if len(active) == 0 || m.cursor >= len(active) || m.service == nil {
+	if m.cursor < 0 || len(active) == 0 || m.cursor >= len(active) || m.service == nil {
 		return m, nil
 	}
 	selected := active[m.cursor]
@@ -1862,6 +1900,20 @@ func (m *Model) viewSidebar() string {
 		helpKeyStyle = lipgloss.NewStyle().Foreground(textMuted)
 		helpDescStyle = lipgloss.NewStyle().Foreground(textDim)
 	}
+	// Highlight the repo name when the project header is selected
+	if m.isProjectHeaderSelected() {
+		if m.focus == focusSidebar {
+			repoStyle = lipgloss.NewStyle().
+				Background(primary).
+				Foreground(lipgloss.Color("#000000")).
+				Bold(true)
+		} else {
+			repoStyle = lipgloss.NewStyle().
+				Background(textDim).
+				Foreground(lipgloss.Color("#000000")).
+				Bold(true)
+		}
+	}
 
 	helpItem := func(key, desc string) string {
 		return helpDescStyle.Render("[") + helpKeyStyle.Render(key) + helpDescStyle.Render("]") + " " + helpDescStyle.Render(desc)
@@ -2473,6 +2525,18 @@ func (m *Model) viewArchivedOverlay() string {
 // --- View switching ---
 
 func (m *Model) switchViewToCurrentSession() tea.Cmd {
+	if m.isProjectHeaderSelected() {
+		sess := m.mainProjectSession()
+		m.activeSession = sess
+		if t, ok := m.terminals[sess.Name]; ok {
+			if t.IsRunning() {
+				tw, th := m.terminalPaneDimensions()
+				t.Resize(tw, th)
+			}
+			return nil
+		}
+		return m.activateSession(sess, false)
+	}
 	active := m.activeSessions()
 	if m.cursor >= 0 && m.cursor < len(active) {
 		sess := active[m.cursor]
