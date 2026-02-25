@@ -5,7 +5,9 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"regexp"
 	"strings"
 	"time"
@@ -104,6 +106,10 @@ type branchesLoadedMsg struct {
 
 type projectsLoadedMsg struct {
 	projects []*database.Project
+}
+
+type spawnTerminalFinishedMsg struct {
+	err error
 }
 
 type projectSwitchedMsg struct {
@@ -428,6 +434,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case sessionUnarchivedMsg:
 		m.message = fmt.Sprintf("Session '%s' unarchived", msg.name)
 		return m, m.loadSessions()
+
+	case spawnTerminalFinishedMsg:
+		if msg.err != nil {
+			m.err = msg.err
+		}
+		// Re-enable mouse tracking after the external shell resets terminal modes
+		return m, tea.EnableMouseCellMotion
 
 	case setupCompleteMsg:
 		if !m.settingUpSessions[msg.sessionName] {
@@ -1186,6 +1199,9 @@ func (m *Model) handleSidebarKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.overlay = overlaySelectProject
 		return m, m.loadProjects()
 
+	case "t":
+		return m.handleSpawnTerminal()
+
 	case "?":
 		m.overlay = overlayHelp
 		return m, nil
@@ -1264,6 +1280,49 @@ func (m *Model) handleEnter() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	return m, m.activateSession(active[m.cursor], true)
+}
+
+func (m *Model) handleSpawnTerminal() (tea.Model, tea.Cmd) {
+	var sess *session.Session
+	if m.isProjectHeaderSelected() {
+		sess = m.mainProjectSession()
+	} else {
+		active := m.activeSessions()
+		if m.cursor >= len(active) {
+			return m, nil
+		}
+		sess = active[m.cursor]
+	}
+
+	shell := os.Getenv("SHELL")
+	if shell == "" {
+		shell = "/bin/sh"
+	}
+
+	c := exec.Command(shell)
+	c.Dir = sess.WorktreePath
+	return m, tea.Exec(&altScreenExec{cmd: c}, func(err error) tea.Msg {
+		return spawnTerminalFinishedMsg{err: err}
+	})
+}
+
+// altScreenExec wraps an exec.Cmd to run inside the terminal's alternate
+// screen buffer, giving the child process a clean display and preserving the
+// parent's scrollback.
+type altScreenExec struct {
+	cmd    *exec.Cmd
+	stdout io.Writer
+}
+
+func (a *altScreenExec) SetStdin(r io.Reader)  { a.cmd.Stdin = r }
+func (a *altScreenExec) SetStdout(w io.Writer) { a.cmd.Stdout = w; a.stdout = w }
+func (a *altScreenExec) SetStderr(w io.Writer) { a.cmd.Stderr = w }
+
+func (a *altScreenExec) Run() error {
+	fmt.Fprint(a.stdout, "\033[?1049h")
+	err := a.cmd.Run()
+	fmt.Fprint(a.stdout, "\033[?1049l")
+	return err
 }
 
 func (m *Model) openCreateOverlay() (tea.Model, tea.Cmd) {
@@ -2382,6 +2441,8 @@ func (m *Model) viewHelpOverlay() string {
 	b.WriteString(dialogTextStyle.Render("  a            Archive session"))
 	b.WriteString("\n")
 	b.WriteString(dialogTextStyle.Render("  p            Switch project"))
+	b.WriteString("\n")
+	b.WriteString(dialogTextStyle.Render("  t            Open shell in worktree"))
 	b.WriteString("\n")
 	b.WriteString(dialogTextStyle.Render("  q            Quit ATC"))
 	b.WriteString("\n\n")
