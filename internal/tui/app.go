@@ -1872,7 +1872,7 @@ func (m *Model) viewSidebar() string {
 
 	// Tower with keyboard shortcuts (rendered outside the border)
 	var tower strings.Builder
-	pad := "    "
+	pad := "   "
 	tower.WriteString("\n")
 	tower.WriteString("  " + towerStyle.Render("__\\-----/__") + pad + helpItem("^C", "back to sidebar") + "\n")
 	tower.WriteString("  " + towerStyle.Render("\\         /") + pad + helpItem("n", " new session") + "\n")
